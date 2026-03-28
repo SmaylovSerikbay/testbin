@@ -572,8 +572,13 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			return
 		}
 
-		if h.maxHold > 0 && now.Sub(st.openedAt) >= h.maxHold {
-			h.triggerClose(st, sym, "TIME", price, now)
+		// TP/SL до TIME: таймер не должен «перебивать» жёсткий стоп; убыток в % на маржу = движение цены × плечо.
+		if price >= st.entry*tpFrac {
+			h.triggerClose(st, sym, "TP", price, now)
+			return
+		}
+		if h.slMarginPct > 0 && price <= st.entry*(1-slMove) {
+			h.triggerClose(st, sym, "SL", price, now)
 			return
 		}
 		if h.scratchDur > 0 && now.Sub(st.openedAt) < h.scratchDur &&
@@ -589,12 +594,8 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 				return
 			}
 		}
-		if price >= st.entry*tpFrac {
-			h.triggerClose(st, sym, "TP", price, now)
-			return
-		}
-		if price <= st.entry*(1-slMove) {
-			h.triggerClose(st, sym, "SL", price, now)
+		if h.maxHold > 0 && now.Sub(st.openedAt) >= h.maxHold {
+			h.triggerClose(st, sym, "TIME", price, now)
 			return
 		}
 		st.lastPrice, st.haveLast = price, true
