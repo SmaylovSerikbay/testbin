@@ -1,6 +1,5 @@
-// Сканер USDT-M фьючерсов: мини-тикер ~1 с. Памп = резкий рост цены И всплеск секундного
-// котируемого объёма (Δq), плюс порог относительно медианы |1s-рет| по символу (меньше мусора).
-// Симуляция: маржа $1, 20×, TP/SL по марже +60% / −15%.
+// USDT-M фьючерсы: вход по раннему сигналу aggTrade (микро-окно) и/или мини-тикеру + Δq.
+// Выход по TP/SL/таймауту; симуляция маржа×плечо.
 package main
 
 import (
@@ -250,6 +249,16 @@ type symState struct {
 	dqBuf    []float64 // кольцо: Δq USDT за тик; 0 = нет данных за эту секунду
 	scratch  []float64
 	barsSeen int // обработано тиков цены (вне позиции и в момент смены last)
+
+	// aggTrade: скользящее окно последних сделок (по времени T с биржи)
+	aggBuf []aggPt
+}
+
+type aggPt struct {
+	ts         int64
+	price      float64
+	quoteUSDT  float64
+	buyerMaker bool
 }
 
 func priceMoveForMarginPct(marginPct float64, lev float64) float64 {
@@ -287,6 +296,54 @@ func parseMiniPayload(raw []byte) (sym string, price float64, quoteVol float64, 
 	return sym, p, qv, true
 }
 
+// aggTrade: p, q, T (ms), m = isBuyerMaker (true → пассивный buyer, агрессивный sell)
+func parseAggPayload(raw []byte) (sym string, price, qty float64, buyerMaker bool, tradeMs int64, ok bool) {
+	var w miniWrap
+	if json.Unmarshal(raw, &w) == nil && len(w.Data) > 0 {
+		raw = w.Data
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return "", 0, 0, false, 0, false
+	}
+	if ev, ok := m["e"].(string); ok && ev != "" && ev != "aggTrade" {
+		return "", 0, 0, false, 0, false
+	}
+	sym, _ = m["s"].(string)
+	p, okp := parseFloatish(m["p"])
+	q, okq := parseFloatish(m["q"])
+	if !okp || !okq || sym == "" || p <= 0 || q <= 0 {
+		return "", 0, 0, false, 0, false
+	}
+	Tf, okT := parseFloatish(m["T"])
+	if !okT {
+		return "", 0, 0, false, 0, false
+	}
+	tradeMs = int64(Tf)
+	switch x := m["m"].(type) {
+	case bool:
+		buyerMaker = x
+	case string:
+		buyerMaker = strings.EqualFold(x, "true")
+	default:
+		buyerMaker = false
+	}
+	return sym, p, q, buyerMaker, tradeMs, true
+}
+
+func streamsKindURL(baseWS string, syms []string, kind string) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSuffix(baseWS, "/"))
+	b.WriteString("/stream?streams=")
+	for i, s := range syms {
+		if i > 0 {
+			b.WriteByte('/')
+		}
+		b.WriteString(strings.ToLower(s) + "@" + kind)
+	}
+	return b.String()
+}
+
 type hub struct {
 	states       sync.Map // symbol -> *symState
 	pumpPct      float64 // минимальный % движения (планка с env)
@@ -311,6 +368,17 @@ type hub struct {
 	dbg      bool
 	dbgWS    atomic.Uint64 // разобранных WS-сообщений мини-тикера
 	dbgWithQ atomic.Uint64 // из них с валидным q
+	dbgAgg   atomic.Uint64
+
+	miniEntry bool // открывать ли позицию по мини-тикеру (если false — только agg)
+
+	aggEnabled    bool
+	aggWindowMs   int64
+	aggMinQuote   float64
+	aggMinMovePct float64
+	aggTakerBuy   bool // только агрессивные покупки (!buyerMaker)
+
+	maxHold time.Duration
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -367,6 +435,11 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 	defer st.mu.Unlock()
 
 	if st.inPos {
+		if h.maxHold > 0 && now.Sub(st.openedAt) >= h.maxHold {
+			pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
+			h.closeTrade(st, sym, "TIME", price, pnl, now)
+			return
+		}
 		if price >= st.entry*h.tpPriceFrac {
 			pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
 			h.closeTrade(st, sym, "TP", price, pnl, now)
@@ -378,6 +451,15 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			return
 		}
 		st.lastPrice, st.haveLast = price, true
+		if haveQ && quoteVol >= 0 {
+			st.lastQuoteVol, st.haveQuoteVol = quoteVol, true
+		}
+		return
+	}
+
+	if !h.miniEntry {
+		st.lastPrice = price
+		st.haveLast = true
 		if haveQ && quoteVol >= 0 {
 			st.lastQuoteVol, st.haveQuoteVol = quoteVol, true
 		}
@@ -481,6 +563,63 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 	}
 }
 
+func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeMs int64, now time.Time) {
+	if !h.aggEnabled {
+		return
+	}
+	v, _ := h.states.LoadOrStore(sym, newSymState(h.notionalUSDT, h.histLen))
+	st := v.(*symState)
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.inPos {
+		return
+	}
+	if h.cooldown > 0 && !st.lastSignalAt.IsZero() && now.Sub(st.lastSignalAt) < h.cooldown {
+		return
+	}
+
+	quote := price * qty
+	st.aggBuf = append(st.aggBuf, aggPt{ts: tradeMs, price: price, quoteUSDT: quote, buyerMaker: buyerMaker})
+	if len(st.aggBuf) > 800 {
+		st.aggBuf = st.aggBuf[len(st.aggBuf)-600:]
+	}
+
+	cutoff := tradeMs - h.aggWindowMs
+	i := 0
+	for i < len(st.aggBuf) && st.aggBuf[i].ts < cutoff {
+		i++
+	}
+	if i > 0 {
+		st.aggBuf = st.aggBuf[i:]
+	}
+
+	var minP, lastQual, sumQ float64
+	var have bool
+	for j := range st.aggBuf {
+		pt := &st.aggBuf[j]
+		if h.aggTakerBuy && pt.buyerMaker {
+			continue
+		}
+		sumQ += pt.quoteUSDT
+		if !have || pt.price < minP {
+			minP = pt.price
+		}
+		lastQual = pt.price
+		have = true
+	}
+	if !have || minP <= 0 {
+		return
+	}
+	movePct := (lastQual - minP) / minP * 100
+	if sumQ < h.aggMinQuote || movePct < h.aggMinMovePct || lastQual <= minP {
+		return
+	}
+	st.lastSignalAt = now
+	st.openSim(lastQual, now)
+}
+
 func newSymState(notional float64, histLen int) *symState {
 	return &symState{
 		notional: notional,
@@ -523,16 +662,7 @@ func chunkStrings(in []string, n int) [][]string {
 }
 
 func streamsURL(baseWS string, syms []string) string {
-	var b strings.Builder
-	b.WriteString(strings.TrimSuffix(baseWS, "/"))
-	b.WriteString("/stream?streams=")
-	for i, s := range syms {
-		if i > 0 {
-			b.WriteByte('/')
-		}
-		b.WriteString(strings.ToLower(s) + "@miniTicker")
-	}
-	return b.String()
+	return streamsKindURL(baseWS, syms, "miniTicker")
 }
 
 func runConnection(ctx context.Context, url string, h *hub, readDeadline time.Duration, wg *sync.WaitGroup) {
@@ -614,7 +744,84 @@ func runConnection(ctx context.Context, url string, h *hub, readDeadline time.Du
 			return
 		default:
 		}
-		log.Printf("переподключение ws...")
+		log.Printf("переподключение ws (mini)...")
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func runAggConnection(ctx context.Context, url string, h *hub, readDeadline time.Duration, wg *sync.WaitGroup) {
+	defer wg.Done()
+	d := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	backoff := time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		conn, _, err := d.Dial(url, nil)
+		if err != nil {
+			log.Printf("ws agg dial: %v, retry %v", err, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second
+		conn.SetReadDeadline(time.Now().Add(readDeadline))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(readDeadline))
+			return nil
+		})
+		go func() {
+			t := time.NewTicker(20 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					_ = conn.WriteMessage(websocket.PingMessage, nil)
+				}
+			}
+		}()
+		readLoop := true
+		for readLoop {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+				return
+			default:
+			}
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("ws agg read: %v", err)
+				_ = conn.Close()
+				readLoop = false
+				break
+			}
+			conn.SetReadDeadline(time.Now().Add(readDeadline))
+			now := time.Now()
+			sym, px, qty, bm, tms, ok := parseAggPayload(msg)
+			if !ok {
+				continue
+			}
+			if h.dbg {
+				h.dbgAgg.Add(1)
+			}
+			h.processAgg(sym, px, qty, bm, tms, now)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		log.Printf("переподключение ws (agg)...")
 		time.Sleep(500 * time.Millisecond)
 	}
 }
@@ -698,23 +905,69 @@ func main() {
 		pticks = 1
 	}
 	dbg := strings.TrimSpace(envGet(em, "PUMP_DEBUG", "")) == "1"
+
+	aggEnabled := strings.TrimSpace(envGet(em, "AGG_ENABLED", "")) == "1"
+	aggWinMs := int64(envGetInt(em, "AGG_WINDOW_MS", 350))
+	if aggWinMs < 80 {
+		aggWinMs = 80
+	}
+	if aggWinMs > 5000 {
+		aggWinMs = 5000
+	}
+	aggMinQ := envGetFloat(em, "AGG_MIN_QUOTE_USDT", 30_000)
+	if aggMinQ < 0 {
+		aggMinQ = 30_000
+	}
+	aggMinMv := envGetFloat(em, "AGG_MIN_MOVE_PCT", 0.06)
+	if aggMinMv < 0 {
+		aggMinMv = 0.06
+	}
+	aggTaker := strings.TrimSpace(envGet(em, "AGG_TAKER_BUY_ONLY", "1")) != "0"
+
+	miniEntS := strings.TrimSpace(envGet(em, "PUMP_MINI_ENTRY", ""))
+	var miniEntry bool
+	switch miniEntS {
+	case "1":
+		miniEntry = true
+	case "0":
+		miniEntry = false
+	default:
+		miniEntry = !aggEnabled
+	}
+	if !aggEnabled && !miniEntry {
+		miniEntry = true
+	}
+
+	maxHoldSec := envGetInt(em, "MAX_HOLD_SEC", 0)
+	var maxHold time.Duration
+	if maxHoldSec > 0 {
+		maxHold = time.Duration(maxHoldSec) * time.Second
+	}
+
 	h := &hub{
-		pumpPct:      pumpPct,
-		pumpFloorPct: pumpFloor,
-		pumpTicks:    pticks,
-		retMult:      retMult,
-		minQuoteDlt:  minQD,
-		volMult:      volMult,
-		warmupBars:   warmup,
-		maxPumpPct:   maxPump,
-		cooldown:     cd,
-		histLen:      histLen,
-		tpPriceFrac:  1 + tpMove,
-		slPriceFrac:  slMove,
-		feeRT:        fee,
-		marginUSDT:   m,
-		notionalUSDT: m * lev,
-		dbg:          dbg,
+		pumpPct:       pumpPct,
+		pumpFloorPct:  pumpFloor,
+		pumpTicks:     pticks,
+		retMult:       retMult,
+		minQuoteDlt:   minQD,
+		volMult:       volMult,
+		warmupBars:    warmup,
+		maxPumpPct:    maxPump,
+		cooldown:      cd,
+		histLen:       histLen,
+		tpPriceFrac:   1 + tpMove,
+		slPriceFrac:   slMove,
+		feeRT:         fee,
+		marginUSDT:    m,
+		notionalUSDT:  m * lev,
+		dbg:           dbg,
+		miniEntry:     miniEntry,
+		aggEnabled:    aggEnabled,
+		aggWindowMs:   aggWinMs,
+		aggMinQuote:   aggMinQ,
+		aggMinMovePct: aggMinMv,
+		aggTakerBuy:   aggTaker,
+		maxHold:       maxHold,
 	}
 	for _, s := range symbols {
 		h.states.Store(s, &symState{notional: m * lev})
@@ -727,6 +980,13 @@ func main() {
 		wg.Add(1)
 		go runConnection(ctx, u, h, readDeadline, &wg)
 	}
+	if aggEnabled {
+		for _, b := range batches {
+			u := streamsKindURL(baseWS, b, "aggTrade")
+			wg.Add(1)
+			go runAggConnection(ctx, u, h, readDeadline, &wg)
+		}
+	}
 
 	priceRule := fmt.Sprintf("max(%.2f%%, floor %.2f%%, %.1f×med|1s|)", pumpPct, pumpFloor, retMult)
 	if retMult <= 0 {
@@ -736,8 +996,29 @@ func main() {
 	if volMult <= 0 {
 		volRule = fmt.Sprintf("≥%.0fk USDT за ~1с (без medΔq)", minQD/1000)
 	}
-	log.Printf("WS: %s — conn=%d streams/sock≤%d | памп: цена ≥ %s; Δq %s; окно=%d разгон=%d тик max=%.1f%% подряд=%d cooldown=%s | симуляция $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
-		baseWS, len(batches), streamsConn, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, m, lev, tpm, slm, tpMove*100, slMove*100)
+	aggRule := "выкл"
+	if aggEnabled {
+		taker := "да"
+		if !aggTaker {
+			taker = "нет"
+		}
+		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT агр. объёма, рост min→last ≥%.3f%%, тейкер-лонг %s",
+			aggWinMs, aggMinQ/1000, aggMinMv, taker)
+	}
+	miniRule := "да"
+	if !miniEntry {
+		miniRule = "нет"
+	}
+	aggConnN := 0
+	if aggEnabled {
+		aggConnN = len(batches)
+	}
+	maxHoldStr := "выкл"
+	if maxHold > 0 {
+		maxHoldStr = maxHold.String()
+	}
+	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | симуляция $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
+		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, m, lev, tpm, slm, tpMove*100, slMove*100)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
@@ -749,8 +1030,8 @@ func main() {
 			case <-tick.C:
 				pnl := float64FromBits(h.totalPnL.Load())
 				if h.dbg {
-					log.Printf("STATS: сделок=%d PnL=%.4f USDT | dbg: ws_msg=%d с_q=%d",
-						h.closedTrades.Load(), pnl, h.dbgWS.Load(), h.dbgWithQ.Load())
+					log.Printf("STATS: сделок=%d PnL=%.4f USDT | dbg: mini=%d с_q=%d agg=%d",
+						h.closedTrades.Load(), pnl, h.dbgWS.Load(), h.dbgWithQ.Load(), h.dbgAgg.Load())
 				} else {
 					log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT (симуляция)",
 						h.closedTrades.Load(), pnl)
