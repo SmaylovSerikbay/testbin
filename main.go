@@ -499,9 +499,10 @@ type hub struct {
 	maxConsecLosses    int     // подряд убыточных сделок (0 = выкл)
 	consecLoss         atomic.Int32
 
-	slConfirmTicks int     // SL только после N подряд тиков ≤ линии стопа (1 = как раньше)
-	cutMarginPct   float64 // 0 = выкл; немедленный выход при ROI на маржу ≤ −X% (модель), без ожидания N тиков SL
-	maxLossUSDT    float64 // 0 = выкл; net в модели ≤ −X USDT — CAP (раньше глубокого SL/fill на альтах)
+	slConfirmTicks int           // SL только после N подряд тиков ≤ линии стопа (1 = как раньше)
+	cutMarginPct   float64       // 0 = выкл; немедленный выход при ROI на маржу ≤ −X% (модель), без ожидания N тиков SL
+	maxLossUSDT    float64       // 0 = выкл; net в модели ≤ −X USDT — CAP (раньше глубокого SL/fill на альтах)
+	capMinHold     time.Duration // не CAP на первых тиках (модель сразу минус на комиссии round-trip)
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -591,7 +592,8 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			h.triggerClose(st, sym, "FLASH", price, now)
 			return
 		}
-		if h.maxLossUSDT > 0 && netEst <= -h.maxLossUSDT {
+		if h.maxLossUSDT > 0 && netEst <= -h.maxLossUSDT &&
+			(h.capMinHold <= 0 || now.Sub(st.openedAt) >= h.capMinHold) {
 			st.slBelowCnt = 0
 			h.triggerClose(st, sym, "CAP", price, now)
 			return
@@ -1367,6 +1369,19 @@ func main() {
 	if maxLossU < 0 {
 		maxLossU = 0
 	}
+	capMinSec := 0
+	if strings.TrimSpace(envGet(em, "PUMP_CAP_MIN_SEC", "")) != "" {
+		capMinSec = envGetInt(em, "PUMP_CAP_MIN_SEC", 0)
+	} else if maxLossU > 0 {
+		capMinSec = 4 // иначе первый тик: net≈−fee и ложный CAP при шуме
+	}
+	if capMinSec < 0 {
+		capMinSec = 0
+	}
+	var capMinHold time.Duration
+	if capMinSec > 0 {
+		capMinHold = time.Duration(capMinSec) * time.Second
+	}
 
 	tpMove := priceMoveForMarginPct(tpm, lev)
 	slMove := priceMoveForMarginPct(slm, lev)
@@ -1662,6 +1677,7 @@ func main() {
 		slConfirmTicks:         slConfirm,
 		cutMarginPct:           cutMg,
 		maxLossUSDT:            maxLossU,
+		capMinHold:             capMinHold,
 	}
 
 	if liveTrading {
@@ -1827,7 +1843,11 @@ func main() {
 	}
 	capStr := "выкл"
 	if maxLossU > 0 {
-		capStr = fmt.Sprintf("net≤−%.4f USDT (модель), CAP", maxLossU)
+		if capMinHold > 0 {
+			capStr = fmt.Sprintf("net≤−%.4f USDT (модель), не раньше %v в позиции", maxLossU, capMinHold.Truncate(time.Second))
+		} else {
+			capStr = fmt.Sprintf("net≤−%.4f USDT (модель)", maxLossU)
+		}
 	}
 	log.Printf("Выход по позиции: CAP=%s | CUT=%s | BANK=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%; TIME+цена≤SL→SL",
 		capStr, cutStr, bankStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100)
