@@ -409,6 +409,9 @@ type hub struct {
 	levInt     int
 	restMu     sync.Mutex
 	openCnt    atomic.Int32
+
+	// лайв: доля доступного баланса под новую позицию (0.88 = оставить запас под IM/комиссии)
+	liveMarginFrac float64
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -762,7 +765,30 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		log.Printf("[%s] плечо по bracket: %d× (запрошено %d×), нотиoнал %.2f USDT",
 			sym, useLev, h.levInt, h.marginUSDT*float64(useLev))
 	}
-	effNotional := h.marginUSDT * float64(useLev)
+	wallet, avail, berr := h.fapi.FuturesUSDTBalance(ctx)
+	if berr != nil {
+		log.Printf("[%s] баланс фьючерсов: %v", sym, berr)
+	}
+	effMargin := h.marginUSDT
+	if avail > 0 && h.liveMarginFrac > 0 && h.liveMarginFrac <= 1 {
+		capM := avail * h.liveMarginFrac
+		if capM < effMargin {
+			effMargin = capM
+		}
+	}
+	if effMargin < 0.02 {
+		h.restMu.Unlock()
+		st.mu.Lock()
+		st.opening = false
+		st.mu.Unlock()
+		log.Printf("[%s] маржа слишком мала (eff=%.4f USDT, доступно≈%.4f), пропуск", sym, effMargin, avail)
+		return
+	}
+	effNotional := effMargin * float64(useLev)
+	if wallet > 0 || avail > 0 {
+		log.Printf("[%s] вход: кошелёк USDT-M=%.4f доступно=%.4f → маржа сделки≈%.4f нотиoнал≈%.2f",
+			sym, wallet, avail, effMargin, effNotional)
+	}
 	qtyStr, _, err := h.fapi.PrepareQtyBuy(sym, effNotional, refPrice)
 	if err != nil {
 		h.restMu.Unlock()
@@ -791,6 +817,7 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 	st.qty = q
 	st.openedAt = now
 	st.posLev = useLev
+	st.notional = effNotional
 	h.openCnt.Add(1)
 	log.Printf("[%s] открыт лонг qty=%.8f avg=%.8f плечо=%d×", sym, q, st.entry, useLev)
 }
@@ -1140,6 +1167,12 @@ func main() {
 	}
 	liveHedge := strings.TrimSpace(envGet(em, "LIVE_HEDGE_MODE", "")) == "1"
 
+	bufPct := envGetFloat(em, "LIVE_MARGIN_BUFFER_PCT", 88)
+	if bufPct <= 0 || bufPct > 100 {
+		bufPct = 88
+	}
+	liveMarginFrac := bufPct / 100
+
 	levInt := int(lev + 0.5)
 	if levInt < 1 {
 		levInt = 1
@@ -1174,8 +1207,9 @@ func main() {
 		maxHold:       maxHold,
 		live:          false,
 		liveHedge:     liveHedge,
-		liveMaxPos:    liveMaxPos,
-		levInt:        levInt,
+		liveMaxPos:       liveMaxPos,
+		levInt:           levInt,
+		liveMarginFrac:   liveMarginFrac,
 	}
 
 	if liveTrading {
@@ -1190,8 +1224,15 @@ func main() {
 		}
 		h.fapi = fc
 		h.live = true
-		log.Printf("РЕЖИМ ЛАЙВ: реальные MARKET-ордера на %s | max одновременных позиций=%d | hedge=%v | плечо=%d×",
-			baseREST, liveMaxPos, liveHedge, levInt)
+		log.Printf("РЕЖИМ ЛАЙВ: реальные MARKET-ордера на %s | max одновременных позиций=%d | hedge=%v | плечо=%d× | буфер маржи %.0f%% доступного",
+			baseREST, liveMaxPos, liveHedge, levInt, bufPct)
+		bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
+		if w, av, err := fc.FuturesUSDTBalance(bctx); err != nil {
+			log.Printf("баланс USDT-M: не удалось прочитать: %v", err)
+		} else {
+			log.Printf("фьючерсный USDT: кошелёк=%.4f доступно для ордеров=%.4f", w, av)
+		}
+		bcancel()
 	}
 
 	for _, s := range symbols {
@@ -1261,6 +1302,17 @@ func main() {
 				if h.dbg {
 					log.Printf("STATS: сделок=%d PnL=%.4f USDT | dbg: mini=%d с_q=%d agg=%d",
 						h.closedTrades.Load(), pnl, h.dbgWS.Load(), h.dbgWithQ.Load(), h.dbgAgg.Load())
+				} else if h.live && h.fapi != nil {
+					sctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+					w, av, err := h.fapi.FuturesUSDTBalance(sctx)
+					cancel()
+					if err != nil {
+						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв] | баланс: %v",
+							h.closedTrades.Load(), pnl, err)
+					} else {
+						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв] | USDT-M кошелёк=%.4f доступно=%.4f",
+							h.closedTrades.Load(), pnl, w, av)
+					}
 				} else {
 					log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT (симуляция)",
 						h.closedTrades.Load(), pnl)

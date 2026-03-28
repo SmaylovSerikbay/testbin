@@ -227,6 +227,29 @@ func (c *fapiClient) getSigned(ctx context.Context, path string, params url.Valu
 	return raw, nil
 }
 
+// FuturesUSDTBalance — кошелёк USDT-M (кросс): кошелёк и доступно для новых ордеров.
+func (c *fapiClient) FuturesUSDTBalance(ctx context.Context) (wallet, available float64, err error) {
+	raw, err := c.getSigned(ctx, "/fapi/v2/account", url.Values{})
+	if err != nil {
+		return 0, 0, err
+	}
+	var acc struct {
+		TotalWalletBalance string `json:"totalWalletBalance"`
+		AvailableBalance   string `json:"availableBalance"`
+		Code               int    `json:"code"`
+		Msg                string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &acc); err != nil {
+		return 0, 0, err
+	}
+	if acc.Code != 0 {
+		return 0, 0, fmt.Errorf("account %d: %s", acc.Code, acc.Msg)
+	}
+	wallet, _ = strconv.ParseFloat(acc.TotalWalletBalance, 64)
+	available, _ = strconv.ParseFloat(acc.AvailableBalance, 64)
+	return wallet, available, nil
+}
+
 func parseOrderFill(raw []byte) (avgPrice, qty float64, err error) {
 	var o fapiOrderResp
 	if err := json.Unmarshal(raw, &o); err != nil {
