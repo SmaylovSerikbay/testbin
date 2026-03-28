@@ -166,21 +166,18 @@ func (c *fapiClient) loadLotSpecs(ctx context.Context) error {
 		if e1 != nil || e2 != nil || step <= 0 || minQ < 0 {
 			continue
 		}
+		// Несколько фильтров (legacy MIN_NOTIONAL + NOTIONAL) — берём максимум, иначе можно занизить и словить −4164.
 		minNtl := 5.0
 		for _, f := range s.Filters {
 			if f.FilterType != "MIN_NOTIONAL" && f.FilterType != "NOTIONAL" {
 				continue
 			}
-			if f.Notional != "" {
-				if v, e := strconv.ParseFloat(f.Notional, 64); e == nil && v > 0 {
-					minNtl = v
-					break
+			for _, raw := range []string{f.Notional, f.MinNotional} {
+				if raw == "" {
+					continue
 				}
-			}
-			if f.MinNotional != "" {
-				if v, e := strconv.ParseFloat(f.MinNotional, 64); e == nil && v > 0 {
+				if v, e := strconv.ParseFloat(raw, 64); e == nil && v > minNtl {
 					minNtl = v
-					break
 				}
 			}
 		}
@@ -202,43 +199,56 @@ func (c *fapiClient) lotFor(symbol string) (lotSpec, error) {
 	return ls, nil
 }
 
-// MarkPrice — публичный mark price (без ключа). Нужен, чтобы не занижать qty при сигнале на локальном хае last/ref.
-func (c *fapiClient) MarkPrice(ctx context.Context, symbol string) (float64, error) {
+// PremiumMarkIndex — mark и index; для min-notional берём min(·): биржа может опираться на более низкий из них → меньше −4164.
+func (c *fapiClient) PremiumMarkIndex(ctx context.Context, symbol string) (mark, index float64, err error) {
 	u := c.base + "/fapi/v1/premiumIndex?symbol=" + url.QueryEscape(symbol)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	resp, err := c.httpc.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		sn := len(raw)
 		if sn > 220 {
 			sn = 220
 		}
-		return 0, fmt.Errorf("premiumIndex HTTP %d: %s", resp.StatusCode, string(raw[:sn]))
+		return 0, 0, fmt.Errorf("premiumIndex HTTP %d: %s", resp.StatusCode, string(raw[:sn]))
 	}
 	var row struct {
-		MarkPrice string `json:"markPrice"`
+		MarkPrice  string `json:"markPrice"`
+		IndexPrice string `json:"indexPrice"`
 	}
 	if err := json.Unmarshal(raw, &row); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if row.MarkPrice == "" {
-		return 0, fmt.Errorf("premiumIndex: пустой markPrice")
+		return 0, 0, fmt.Errorf("premiumIndex: пустой markPrice")
 	}
-	mp, err := strconv.ParseFloat(row.MarkPrice, 64)
-	if err != nil || mp <= 0 {
-		return 0, fmt.Errorf("premiumIndex: markPrice %q", row.MarkPrice)
+	mark, err = strconv.ParseFloat(row.MarkPrice, 64)
+	if err != nil || mark <= 0 {
+		return 0, 0, fmt.Errorf("premiumIndex: markPrice %q", row.MarkPrice)
 	}
-	return mp, nil
+	if row.IndexPrice != "" {
+		index, _ = strconv.ParseFloat(row.IndexPrice, 64)
+	}
+	if index <= 0 {
+		index = mark
+	}
+	return mark, index, nil
+}
+
+// MarkPrice — публичный mark (без ключа).
+func (c *fapiClient) MarkPrice(ctx context.Context, symbol string) (float64, error) {
+	m, _, err := c.PremiumMarkIndex(ctx, symbol)
+	return m, err
 }
 
 func roundQtyDown(q, step float64) float64 {
@@ -315,7 +325,20 @@ func (c *fapiClient) BookTickerBid(ctx context.Context, symbol string) (float64,
 	return b, nil
 }
 
-// PrepareQtyBuyLive — min(ref, mark, bid) для первичного qty, затем дожим шагами пока qty×mark ≥ MIN_NOTIONAL.
+// notionalCheckRef — консервативная цена для min-notional (лонг): ниже цена → меньше USDT на тот же qty.
+func notionalCheckRef(mark, index float64) float64 {
+	if mark <= 0 {
+		return index
+	}
+	if index <= 0 {
+		return mark
+	}
+	return math.Min(mark, index)
+}
+
+const minNotionalOrderSlack = 1.022 // запас к лимиту биржи и рассинхрону mark/index между REST-вызовами
+
+// PrepareQtyBuyLive — min(ref, mark, bid) для первичного qty, затем дожим шагами пока qty×min(mark,index) ≥ MIN_NOTIONAL×slack.
 func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notionalUSDT, refSignal float64) (qtyStr string, qty float64, err error) {
 	if notionalUSDT <= 0 || refSignal <= 0 {
 		return "", 0, fmt.Errorf("некорректная цена/нотиoнал")
@@ -328,9 +351,10 @@ func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notio
 	if minN <= 0 {
 		minN = 5
 	}
+	minNeed := minN * minNotionalOrderSlack
 	floor := refSignal
-	if mp, e := c.MarkPrice(ctx, symbol); e == nil && mp > 0 {
-		floor = math.Min(floor, mp)
+	if mp, idx, e := c.PremiumMarkIndex(ctx, symbol); e == nil && mp > 0 {
+		floor = math.Min(floor, notionalCheckRef(mp, idx))
 	}
 	if bid, e := c.BookTickerBid(ctx, symbol); e == nil && bid > 0 {
 		floor = math.Min(floor, bid)
@@ -344,12 +368,29 @@ func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notio
 		return "", 0, err
 	}
 	for attempt := 0; attempt < 64; attempt++ {
-		mp, e := c.MarkPrice(ctx, symbol)
+		mp, idx, e := c.PremiumMarkIndex(ctx, symbol)
 		if e != nil || mp <= 0 {
 			mp = fFloor
+			idx = mp
 		}
-		if qty*mp >= minN-1e-10 {
-			return formatQtyString(qty, ls.step), qty, nil
+		ntlRef := notionalCheckRef(mp, idx)
+		if qty*mp > notionalUSDT+1e-6 {
+			return "", 0, fmt.Errorf("min notional %.2f: при mark≈%.8f не хватает нотиoнала %.2f USDT (%s)", minN, mp, notionalUSDT, symbol)
+		}
+		if qty*ntlRef >= minNeed-1e-10 {
+			out := formatQtyString(qty, ls.step)
+			qp, perr := strconv.ParseFloat(out, 64)
+			if perr != nil || qp <= 0 {
+				return out, qty, nil
+			}
+			if qp*ntlRef >= minNeed-1e-10 {
+				return out, qp, nil
+			}
+			qty = roundQtyCeil(qp+ls.step, ls.step)
+			if qty < ls.minQ {
+				qty = ls.minQ
+			}
+			continue
 		}
 		prev := qty
 		qty = roundQtyCeil(prev+ls.step, ls.step)
@@ -359,16 +400,57 @@ func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notio
 		if qty < ls.minQ {
 			qty = ls.minQ
 		}
-		if qty*mp > notionalUSDT+1e-6 {
-			return "", 0, fmt.Errorf("min notional %.2f: при mark≈%.8f не хватает нотиoнала %.2f USDT (%s)", minN, mp, notionalUSDT, symbol)
-		}
 		qtyStr = formatQtyString(qty, ls.step)
 	}
-	mp, _ := c.MarkPrice(ctx, symbol)
+	mp, idx, _ := c.PremiumMarkIndex(ctx, symbol)
 	if mp <= 0 {
 		mp = fFloor
+		idx = mp
 	}
-	return "", 0, fmt.Errorf("qty×mark≈%.6f < min notional %.2f после дожима (%s)", qty*mp, minN, symbol)
+	ntlRef := notionalCheckRef(mp, idx)
+	return "", 0, fmt.Errorf("qty×min(mark,index)≈%.6f < min notional %.2f×slack после дожима (%s)", qty*ntlRef, minN, symbol)
+}
+
+// BumpQtyAfter4164 — после отказа биржи по min-notional: поднять qty по шагу, не превышая notionalCap по mark.
+func (c *fapiClient) BumpQtyAfter4164(ctx context.Context, symbol, qtyStr string, notionalCap float64) (string, error) {
+	ls, err := c.lotFor(symbol)
+	if err != nil {
+		return "", err
+	}
+	minN := ls.minNtl
+	if minN <= 0 {
+		minN = 5
+	}
+	minNeed := minN * minNotionalOrderSlack
+	qty, err := strconv.ParseFloat(strings.TrimSpace(qtyStr), 64)
+	if err != nil || qty <= 0 {
+		return "", fmt.Errorf("qty из строки %q: %w", qtyStr, err)
+	}
+	for attempt := 0; attempt < 56; attempt++ {
+		mp, idx, e := c.PremiumMarkIndex(ctx, symbol)
+		if e != nil {
+			return "", e
+		}
+		if mp <= 0 {
+			return "", fmt.Errorf("premiumIndex: mark≤0 (%s)", symbol)
+		}
+		ntlRef := notionalCheckRef(mp, idx)
+		if qty*mp > notionalCap+1e-5 {
+			return "", fmt.Errorf("−4164 retry: qty×mark≈%.6f > лимит нотиoнала %.2f (%s)", qty*mp, notionalCap, symbol)
+		}
+		if qty*ntlRef >= minNeed-1e-10 {
+			return formatQtyString(qty, ls.step), nil
+		}
+		next := roundQtyCeil(qty+ls.step, ls.step)
+		if next <= qty {
+			next = qty + ls.step
+		}
+		if next < ls.minQ {
+			next = ls.minQ
+		}
+		qty = next
+	}
+	return "", fmt.Errorf("−4164 retry: не удалось добить min-notional (%s)", symbol)
 }
 
 func (c *fapiClient) postSigned(ctx context.Context, path string, params url.Values) ([]byte, error) {

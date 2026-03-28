@@ -11,6 +11,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -23,6 +24,9 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// Публичные klines (без ключа); отдельный таймаут от торгового REST.
+var fapiPublicHTTP = &http.Client{Timeout: 8 * time.Second}
 
 const (
 	marginUSDT         = 1.0
@@ -293,6 +297,115 @@ type flashSample struct {
 	p float64
 }
 
+func validateHTFInterval(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	switch s {
+	case "1m", "3m", "5m", "15m", "30m", "1h":
+		return s
+	default:
+		return "1m"
+	}
+}
+
+func klineParseFloat(v interface{}) (float64, error) {
+	switch x := v.(type) {
+	case string:
+		return strconv.ParseFloat(x, 64)
+	case float64:
+		return x, nil
+	case json.Number:
+		return x.Float64()
+	default:
+		return 0, fmt.Errorf("kline: тип %T", v)
+	}
+}
+
+func klineOpenClose(row []interface{}) (open, close float64, err error) {
+	if len(row) < 5 {
+		return 0, 0, fmt.Errorf("kline: короткая строка")
+	}
+	open, err = klineParseFloat(row[1])
+	if err != nil {
+		return 0, 0, err
+	}
+	close, err = klineParseFloat(row[4])
+	return open, close, err
+}
+
+func fetchFuturesKlines(ctx context.Context, baseREST, symbol, interval string, limit int) ([][]interface{}, error) {
+	base := strings.TrimSuffix(baseREST, "/")
+	u := fmt.Sprintf("%s/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
+		base, url.QueryEscape(symbol), url.QueryEscape(interval), limit)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := fapiPublicHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		sn := len(b)
+		if sn > 300 {
+			sn = 300
+		}
+		return nil, fmt.Errorf("klines HTTP %d: %s", resp.StatusCode, string(b[:sn]))
+	}
+	var rows [][]interface{}
+	if err := json.Unmarshal(b, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (h *hub) checkHTFLong(ctx context.Context, sym string) (ok bool, reason string) {
+	if h.htfFilter <= 0 || h.restBase == "" {
+		return true, ""
+	}
+	limit := 4
+	if h.htfFilter >= 2 {
+		limit = 5
+	}
+	rows, err := fetchFuturesKlines(ctx, h.restBase, sym, h.htfInterval, limit)
+	if err != nil {
+		return false, err.Error()
+	}
+	if len(rows) < 3 {
+		return false, fmt.Sprintf("мало свечей (%d)", len(rows))
+	}
+	n := len(rows)
+	o1, c1, err := klineOpenClose(rows[n-2])
+	if err != nil {
+		return false, err.Error()
+	}
+	_, c0, err := klineOpenClose(rows[n-3])
+	if err != nil {
+		return false, err.Error()
+	}
+	switch h.htfFilter {
+	case 1:
+		if c1 <= o1 {
+			return false, fmt.Sprintf("%s: последняя закрытая не бычья (C≤O)", h.htfInterval)
+		}
+	case 2:
+		if c1 <= c0 {
+			return false, fmt.Sprintf("%s: close ≤ предыдущего close", h.htfInterval)
+		}
+	case 3:
+		if c1 <= o1 || c1 <= c0 {
+			return false, fmt.Sprintf("%s: нужны бычья + рост close", h.htfInterval)
+		}
+	default:
+		return true, ""
+	}
+	return true, ""
+}
+
 func priceMoveForMarginPct(marginPct float64, lev float64) float64 {
 	return (marginPct / 100) / lev
 }
@@ -458,6 +571,13 @@ type hub struct {
 	aggMinQualTrades       int     // 0 = выкл
 	aggMinSingleTradeUSDT  float64 // 0 = выкл; max одной квалиф. сделки в USDT ≥ порога («крупный тик»)
 	aggMinHighLowRangePct  float64 // 0 = выкл; (max−min)/min в окне в % — отсекаем узкий 2–3% дребезг
+	// Оконный VWAP по квалиф. сделкам: last ≥ VWAP на N% (идея из VWAP/объёмных скальпинг-фильтров, меньше «пустых» тиков).
+	aggMinLastOverVwapPct float64
+
+	// Старший таймфрейм по REST klines (публично): направление последних закрытых свечей перед лонгом.
+	restBase    string
+	htfFilter   int    // 0=выкл; 1=последняя закрытая бычья (C>O); 2=close>prev close; 3=оба
+	htfInterval string // 1m, 5m, …
 
 	maxHold time.Duration
 
@@ -500,7 +620,9 @@ type hub struct {
 	consecLoss         atomic.Int32
 
 	slConfirmTicks int           // SL только после N подряд тиков ≤ линии стопа (1 = как раньше)
-	cutMarginPct   float64       // 0 = выкл; немедленный выход при ROI на маржу ≤ −X% (модель), без ожидания N тиков SL
+	cutMarginPct   float64       // 0 = выкл; выход при ROI на маржу ≤ −X% (модель), быстрее чем SL подряд N тиков
+	cutMinHold     time.Duration // не CUT на первых секундах (модель ≈ −fee при цене у входа)
+	cutNeedBelow   bool          // true: CUT только если цена < входа (не резать «зелёный» тик из‑за комиссии)
 	maxLossUSDT    float64       // 0 = выкл; net в модели ≤ −X USDT — CAP (раньше глубокого SL/fill на альтах)
 	capMinHold     time.Duration // не CAP на первых тиках (модель сразу минус на комиссии round-trip)
 }
@@ -654,8 +776,10 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 				return
 			}
 		}
-		// Медленный слив: SL ждёт N тиков подряд, а убыток в модели уже большой — режем за один тик.
-		if h.cutMarginPct > 0 && h.marginUSDT > 1e-12 && netEst < 0 {
+		// Медленный слив: SL ждёт N тиков подряд; CUT — только реальное проседание цены (не один шум + комиссия).
+		cutHoldOK := h.cutMinHold <= 0 || now.Sub(st.openedAt) >= h.cutMinHold
+		cutDirOK := !h.cutNeedBelow || price < st.entry
+		if h.cutMarginPct > 0 && h.marginUSDT > 1e-12 && netEst < 0 && cutHoldOK && cutDirOK {
 			if netEst/h.marginUSDT*100 <= -h.cutMarginPct {
 				st.slBelowCnt = 0
 				h.triggerClose(st, sym, "CUT", price, now)
@@ -780,7 +904,6 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 
 	if st.pumpArmCnt >= h.pumpTicks {
 		st.pumpArmCnt = 0
-		st.lastSignalAt = now
 		if h.live {
 			if h.entriesPaused.Load() || st.opening || st.inPos {
 				return
@@ -789,6 +912,15 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			go h.doOpenAsync(sym, st, price, now)
 			return
 		}
+		if st.opening || st.inPos {
+			return
+		}
+		if h.htfFilter > 0 {
+			st.opening = true
+			go h.doOpenSimAfterHTF(sym, st, price, now)
+			return
+		}
+		st.lastSignalAt = now
 		st.openSim(price, now)
 	}
 }
@@ -828,7 +960,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		st.aggBuf = st.aggBuf[i:]
 	}
 
-	var minP, maxP, lastQual, firstQual, sumQ, maxSingleQ float64
+	var minP, maxP, lastQual, firstQual, sumQ, maxSingleQ, baseVolSum float64
 	var have bool
 	qualN := 0
 	for j := range st.aggBuf {
@@ -838,6 +970,9 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		}
 		qualN++
 		sumQ += pt.quoteUSDT
+		if pt.price > 0 {
+			baseVolSum += pt.quoteUSDT / pt.price
+		}
 		if pt.quoteUSDT > maxSingleQ {
 			maxSingleQ = pt.quoteUSDT
 		}
@@ -881,7 +1016,16 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 	if h.aggMinSingleTradeUSDT > 0 && maxSingleQ < h.aggMinSingleTradeUSDT {
 		return
 	}
-	st.lastSignalAt = now
+	if h.aggMinLastOverVwapPct > 0 && baseVolSum > 0 && lastQual > 0 {
+		vwap := sumQ / baseVolSum
+		if vwap <= 0 {
+			return
+		}
+		overVwapPct := (lastQual - vwap) / vwap * 100
+		if overVwapPct < h.aggMinLastOverVwapPct {
+			return
+		}
+	}
 	if h.live {
 		if h.entriesPaused.Load() || st.opening || st.inPos {
 			return
@@ -890,6 +1034,15 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		go h.doOpenAsync(sym, st, lastQual, now)
 		return
 	}
+	if st.opening || st.inPos {
+		return
+	}
+	if h.htfFilter > 0 {
+		st.opening = true
+		go h.doOpenSimAfterHTF(sym, st, lastQual, now)
+		return
+	}
+	st.lastSignalAt = now
 	st.openSim(lastQual, now)
 }
 
@@ -977,6 +1130,24 @@ func (h *hub) triggerClose(st *symState, sym, reason string, price float64, now 
 	h.closeTrade(st, sym, reason, price, pnl, now)
 }
 
+func (h *hub) doOpenSimAfterHTF(sym string, st *symState, ref float64, now time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ok, why := h.checkHTFLong(ctx, sym)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.opening = false
+	if !ok {
+		log.Printf("[%s] симуляция: пропуск HTF: %s", sym, why)
+		return
+	}
+	if st.inPos {
+		return
+	}
+	st.lastSignalAt = now
+	st.openSim(ref, now)
+}
+
 func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
@@ -987,6 +1158,19 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		st.mu.Unlock()
 		return
 	}
+
+	if h.htfFilter > 0 {
+		if ok, why := h.checkHTFLong(ctx, sym); !ok {
+			st.mu.Lock()
+			st.opening = false
+			st.mu.Unlock()
+			log.Printf("[%s] пропуск HTF: %s", sym, why)
+			return
+		}
+	}
+	st.mu.Lock()
+	st.lastSignalAt = now
+	st.mu.Unlock()
 
 	h.restMu.Lock()
 	if int(h.openCnt.Load()) >= h.liveMaxPos {
@@ -1051,6 +1235,14 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		return
 	}
 	avg, q, err := h.fapi.MarketBuyLong(ctx, sym, qtyStr, h.liveHedge)
+	if err != nil && (strings.Contains(err.Error(), "-4164") || strings.Contains(err.Error(), "notional must be no smaller")) {
+		if q2, berr := h.fapi.BumpQtyAfter4164(ctx, sym, qtyStr, effNotional); berr == nil {
+			avg, q, err = h.fapi.MarketBuyLong(ctx, sym, q2, h.liveHedge)
+			if err == nil {
+				qtyStr = q2
+			}
+		}
+	}
 	h.restMu.Unlock()
 
 	st.mu.Lock()
@@ -1365,6 +1557,20 @@ func main() {
 	if cutMg < 0 {
 		cutMg = 0
 	}
+	cutMinSec := 0
+	if strings.TrimSpace(envGet(em, "PUMP_CUT_MIN_SEC", "")) != "" {
+		cutMinSec = envGetInt(em, "PUMP_CUT_MIN_SEC", 0)
+	} else if cutMg > 0 {
+		cutMinSec = 4
+	}
+	if cutMinSec < 0 {
+		cutMinSec = 0
+	}
+	var cutMinHold time.Duration
+	if cutMinSec > 0 {
+		cutMinHold = time.Duration(cutMinSec) * time.Second
+	}
+	cutNeedBelow := strings.TrimSpace(envGet(em, "PUMP_CUT_REQUIRE_BELOW_ENTRY", "1")) != "0"
 	maxLossU := envGetFloat(em, "PUMP_MAX_LOSS_USDT", 0)
 	if maxLossU < 0 {
 		maxLossU = 0
@@ -1491,7 +1697,23 @@ func main() {
 	if aggMinHlRg < 0 {
 		aggMinHlRg = 0
 	}
+	aggVwapMin := envGetFloat(em, "AGG_MIN_LAST_OVER_VWAP_PCT", 0)
+	if aggVwapMin < 0 {
+		aggVwapMin = 0
+	}
+	if liveTrading && aggVwapMin > 0 {
+		aggVwapMin += envGetFloat(em, "LIVE_AGG_VWAP_ADD_PCT", 0)
+	}
+	if aggVwapMin < 0 {
+		aggVwapMin = 0
+	}
 	aggTaker := strings.TrimSpace(envGet(em, "AGG_TAKER_BUY_ONLY", "1")) != "0"
+
+	htfF := envGetInt(em, "PUMP_HTF_FILTER", 0)
+	if htfF < 0 || htfF > 3 {
+		htfF = 0
+	}
+	htfIv := validateHTFInterval(envGet(em, "PUMP_HTF_INTERVAL", "1m"))
 
 	miniEntS := strings.TrimSpace(envGet(em, "PUMP_MINI_ENTRY", ""))
 	var miniEntry bool
@@ -1623,6 +1845,9 @@ func main() {
 	}
 
 	h := &hub{
+		restBase:               baseREST,
+		htfFilter:              htfF,
+		htfInterval:            htfIv,
 		pumpPct:                pumpPct,
 		pumpFloorPct:           pumpFloor,
 		pumpTicks:              pticks,
@@ -1650,6 +1875,7 @@ func main() {
 		aggMinQualTrades:       aggMinQualTr,
 		aggMinSingleTradeUSDT:  aggMinSingle,
 		aggMinHighLowRangePct:  aggMinHlRg,
+		aggMinLastOverVwapPct:  aggVwapMin,
 		maxHold:                maxHold,
 		live:                   false,
 		liveHedge:              liveHedge,
@@ -1676,6 +1902,8 @@ func main() {
 		maxConsecLosses:        maxConsecLoss,
 		slConfirmTicks:         slConfirm,
 		cutMarginPct:           cutMg,
+		cutMinHold:             cutMinHold,
+		cutNeedBelow:           cutNeedBelow,
 		maxLossUSDT:            maxLossU,
 		capMinHold:             capMinHold,
 	}
@@ -1777,12 +2005,16 @@ func main() {
 		if aggMinHlRg > 0 {
 			hlNote = fmt.Sprintf(", размах (max−min)/min ≥%.3f%%", aggMinHlRg)
 		}
+		vwapNote := ""
+		if aggVwapMin > 0 {
+			vwapNote = fmt.Sprintf(", last≥VWAP окна +%.3f%%", aggVwapMin)
+		}
 		liveBoost := ""
 		if liveTrading {
 			liveBoost = " [лайв: усиленные пороги]"
 		}
-		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s%s%s%s%s, тейкер %s%s",
-			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, hlNote, lofNote, qNote, singleNote, taker, liveBoost)
+		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s%s%s%s%s%s, тейкер %s%s",
+			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, hlNote, vwapNote, lofNote, qNote, singleNote, taker, liveBoost)
 	}
 	miniRule := "да"
 	if !miniEntry {
@@ -1800,8 +2032,16 @@ func main() {
 	if h.live {
 		modeStr = fmt.Sprintf("ЛАЙВ (max поз=%d)", liveMaxPos)
 	}
-	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%) | SL подряд %d тик(а)",
-		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100, slConfirm)
+	htfNote := "HTF выкл"
+	if htfF == 1 {
+		htfNote = fmt.Sprintf("HTF %s: последняя закрытая бычья (C>O)", htfIv)
+	} else if htfF == 2 {
+		htfNote = fmt.Sprintf("HTF %s: close > prev close", htfIv)
+	} else if htfF == 3 {
+		htfNote = fmt.Sprintf("HTF %s: бычья + close↑ (оба)", htfIv)
+	}
+	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%) | SL подряд %d тик(а)",
+		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, htfNote, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100, slConfirm)
 	scratchStr := "выкл"
 	if scratchDur > 0 {
 		scratchStr = fmt.Sprintf("первые %s", scratchDur.String())
@@ -1839,7 +2079,13 @@ func main() {
 	}
 	cutStr := "выкл"
 	if cutMg > 0 {
-		cutStr = fmt.Sprintf("ROI≤−%.1f%% на маржу (модель), один тик", cutMg)
+		cutStr = fmt.Sprintf("ROI≤−%.1f%% на маржу (модель)", cutMg)
+		if cutNeedBelow {
+			cutStr += ", цена<вход"
+		}
+		if cutMinHold > 0 {
+			cutStr += fmt.Sprintf(", не раньше %v", cutMinHold.Truncate(time.Second))
+		}
 	}
 	capStr := "выкл"
 	if maxLossU > 0 {
