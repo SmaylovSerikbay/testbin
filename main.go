@@ -131,6 +131,35 @@ func medianSorted(s []float64) float64 {
 	return (s[mid-1] + s[mid]) / 2
 }
 
+// Binance в WS отдаёт c/q как строку или число — оба варианта должны разбираться.
+func parseFloatish(v any) (float64, bool) {
+	if v == nil {
+		return 0, false
+	}
+	switch x := v.(type) {
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return 0, false
+		}
+		return x, true
+	case string:
+		x = strings.TrimSpace(x)
+		if x == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(x, 64)
+		if err != nil || math.IsNaN(f) {
+			return 0, false
+		}
+		return f, true
+	case json.Number:
+		f, err := x.Float64()
+		return f, err == nil && !math.IsNaN(f)
+	default:
+		return 0, false
+	}
+}
+
 // ---- REST ----
 
 type exchSymbol struct {
@@ -234,39 +263,28 @@ type miniWrap struct {
 	Data   json.RawMessage `json:"data"`
 }
 
-type miniTicker struct {
-	E string `json:"e"`
-	S string `json:"s"`
-	C string `json:"c"` // last price
-	Q string `json:"q"` // накопленный quote volume за 24h
-}
-
 func parseMiniPayload(raw []byte) (sym string, price float64, quoteVol float64, ok bool) {
 	var w miniWrap
 	if json.Unmarshal(raw, &w) == nil && len(w.Data) > 0 {
 		raw = w.Data
 	}
-	var t miniTicker
-	if err := json.Unmarshal(raw, &t); err != nil {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
 		return "", 0, 0, false
 	}
-	if t.S == "" || t.C == "" {
+	sym, _ = m["s"].(string)
+	if sym == "" {
 		return "", 0, 0, false
 	}
-	p, err := strconv.ParseFloat(t.C, 64)
-	if err != nil || p <= 0 || math.IsNaN(p) {
+	p, okp := parseFloatish(m["c"])
+	if !okp || p <= 0 {
 		return "", 0, 0, false
 	}
-	var q float64
-	if strings.TrimSpace(t.Q) != "" {
-		q, err = strconv.ParseFloat(t.Q, 64)
-		if err != nil || q < 0 || math.IsNaN(q) {
-			q = -1
-		}
-	} else {
-		q = -1
+	qv := -1.0
+	if q, okq := parseFloatish(m["q"]); okq && q >= 0 {
+		qv = q
 	}
-	return t.S, p, q, true
+	return sym, p, qv, true
 }
 
 type hub struct {
@@ -289,6 +307,10 @@ type hub struct {
 	notionalUSDT float64
 	totalPnL     atomic.Uint64 // bits of float64
 	closedTrades atomic.Uint64
+
+	dbg      bool
+	dbgWS    atomic.Uint64 // разобранных WS-сообщений мини-тикера
+	dbgWithQ atomic.Uint64 // из них с валидным q
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -579,6 +601,12 @@ func runConnection(ctx context.Context, url string, h *hub, readDeadline time.Du
 				continue
 			}
 			haveQ := qv >= 0
+			if h.dbg {
+				h.dbgWS.Add(1)
+				if haveQ {
+					h.dbgWithQ.Add(1)
+				}
+			}
 			h.processTick(sym, px, qv, haveQ, now)
 		}
 		select {
@@ -669,6 +697,7 @@ func main() {
 	if pticks < 1 {
 		pticks = 1
 	}
+	dbg := strings.TrimSpace(envGet(em, "PUMP_DEBUG", "")) == "1"
 	h := &hub{
 		pumpPct:      pumpPct,
 		pumpFloorPct: pumpFloor,
@@ -685,6 +714,7 @@ func main() {
 		feeRT:        fee,
 		marginUSDT:   m,
 		notionalUSDT: m * lev,
+		dbg:          dbg,
 	}
 	for _, s := range symbols {
 		h.states.Store(s, &symState{notional: m * lev})
@@ -718,8 +748,13 @@ func main() {
 				return
 			case <-tick.C:
 				pnl := float64FromBits(h.totalPnL.Load())
-				log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT (симуляция)",
-					h.closedTrades.Load(), pnl)
+				if h.dbg {
+					log.Printf("STATS: сделок=%d PnL=%.4f USDT | dbg: ws_msg=%d с_q=%d",
+						h.closedTrades.Load(), pnl, h.dbgWS.Load(), h.dbgWithQ.Load())
+				} else {
+					log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT (симуляция)",
+						h.closedTrades.Load(), pnl)
+				}
 			}
 		}
 	}()
