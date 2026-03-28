@@ -450,7 +450,8 @@ type hub struct {
 	aggWindowMs   int64
 	aggMinQuote   float64
 	aggMinMovePct float64
-	aggTakerBuy   bool // только агрессивные покупки (!buyerMaker)
+	aggNearPeakFrac float64 // 0 = выкл; последняя цена ≥ max окна × (1−frac)
+	aggTakerBuy   bool      // только агрессивные покупки (!buyerMaker)
 
 	maxHold time.Duration
 
@@ -746,7 +747,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		st.aggBuf = st.aggBuf[i:]
 	}
 
-	var minP, lastQual, sumQ float64
+	var minP, maxP, lastQual, sumQ float64
 	var have bool
 	for j := range st.aggBuf {
 		pt := &st.aggBuf[j]
@@ -754,17 +755,27 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 			continue
 		}
 		sumQ += pt.quoteUSDT
-		if !have || pt.price < minP {
-			minP = pt.price
+		if !have {
+			minP, maxP = pt.price, pt.price
+		} else {
+			if pt.price < minP {
+				minP = pt.price
+			}
+			if pt.price > maxP {
+				maxP = pt.price
+			}
 		}
 		lastQual = pt.price
 		have = true
 	}
-	if !have || minP <= 0 {
+	if !have || minP <= 0 || maxP <= 0 {
 		return
 	}
 	movePct := (lastQual - minP) / minP * 100
 	if sumQ < h.aggMinQuote || movePct < h.aggMinMovePct || lastQual <= minP {
+		return
+	}
+	if h.aggNearPeakFrac > 0 && lastQual < maxP*(1-h.aggNearPeakFrac) {
 		return
 	}
 	st.lastSignalAt = now
@@ -1273,6 +1284,21 @@ func main() {
 	if aggMinMv < 0 {
 		aggMinMv = 0.06
 	}
+	liveTrading := strings.TrimSpace(envGet(em, "LIVE_TRADING", "")) == "1"
+	var aggNearPeakFrac float64
+	if v := strings.TrimSpace(envGet(em, "AGG_LAST_NEAR_PEAK_PCT", "")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			aggNearPeakFrac = f / 100
+		}
+	} else if liveTrading {
+		aggNearPeakFrac = 0.001
+	}
+	if liveTrading {
+		if mq := envGetFloat(em, "LIVE_AGG_QUOTE_MULT", 1.32); mq > 1 {
+			aggMinQ *= mq
+		}
+		aggMinMv += envGetFloat(em, "LIVE_AGG_MOVE_ADD_PCT", 0.04)
+	}
 	aggTaker := strings.TrimSpace(envGet(em, "AGG_TAKER_BUY_ONLY", "1")) != "0"
 
 	miniEntS := strings.TrimSpace(envGet(em, "PUMP_MINI_ENTRY", ""))
@@ -1346,12 +1372,11 @@ func main() {
 	if minAvailTrade < 0 {
 		minAvailTrade = 0
 	}
-	maxConsecLoss := envGetInt(em, "LIVE_MAX_CONSECUTIVE_LOSSES", 5)
+	maxConsecLoss := envGetInt(em, "LIVE_MAX_CONSECUTIVE_LOSSES", 8)
 	if maxConsecLoss < 0 {
 		maxConsecLoss = 0
 	}
 
-	liveTrading := strings.TrimSpace(envGet(em, "LIVE_TRADING", "")) == "1"
 	liveMaxPos := envGetInt(em, "LIVE_MAX_POSITIONS", 1)
 	if liveMaxPos < 1 {
 		liveMaxPos = 1
@@ -1392,9 +1417,10 @@ func main() {
 		miniEntry:     miniEntry,
 		aggEnabled:    aggEnabled,
 		aggWindowMs:   aggWinMs,
-		aggMinQuote:   aggMinQ,
-		aggMinMovePct: aggMinMv,
-		aggTakerBuy:   aggTaker,
+		aggMinQuote:     aggMinQ,
+		aggMinMovePct:   aggMinMv,
+		aggNearPeakFrac: aggNearPeakFrac,
+		aggTakerBuy:     aggTaker,
 		maxHold:       maxHold,
 		live:          false,
 		liveHedge:     liveHedge,
@@ -1491,8 +1517,16 @@ func main() {
 		if !aggTaker {
 			taker = "нет"
 		}
-		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT агр. объёма, рост min→last ≥%.3f%%, тейкер-лонг %s",
-			aggWinMs, aggMinQ/1000, aggMinMv, taker)
+		peakNote := ""
+		if aggNearPeakFrac > 0 {
+			peakNote = fmt.Sprintf(", last у хая окна (≤%.3f%% от max)", aggNearPeakFrac*100)
+		}
+		liveBoost := ""
+		if liveTrading {
+			liveBoost = " [лайв: усиленные пороги]"
+		}
+		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s, тейкер %s%s",
+			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, taker, liveBoost)
 	}
 	miniRule := "да"
 	if !miniEntry {
