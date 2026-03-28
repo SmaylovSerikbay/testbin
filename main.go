@@ -267,6 +267,7 @@ type symState struct {
 	posLev       int     // фактическое плечо лайв-позиции (0 = симуляция / не задано)
 	peakPx       float64 // максимум цены в позиции (для трейлинга)
 	trailArmed   bool    // был ли откат от пика после «настоящего» движения (с учётом комиссии)
+	slBelowCnt   int     // подряд тиков с ценой ≤ линии SL (антимикрошум + меньше «ножа» на одном тике)
 
 	retBuf   []float64 // кольцо: % изменения цены за тик (~1 с)
 	dqBuf    []float64 // кольцо: Δq USDT за тик; 0 = нет данных за эту секунду
@@ -495,6 +496,8 @@ type hub struct {
 	minAvailToTrade    float64 // не открывать если available ниже (0 = выкл)
 	maxConsecLosses    int     // подряд убыточных сделок (0 = выкл)
 	consecLoss         atomic.Int32
+
+	slConfirmTicks int // SL только после N подряд тиков ≤ линии стопа (1 = как раньше)
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -587,12 +590,26 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 
 		// TP/SL до TIME: таймер не должен «перебивать» жёсткий стоп; убыток в % на маржу = движение цены × плечо.
 		if price >= st.entry*tpFrac {
+			st.slBelowCnt = 0
 			h.triggerClose(st, sym, "TP", price, now)
 			return
 		}
-		if h.slMarginPct > 0 && price <= st.entry*(1-slMove) {
-			h.triggerClose(st, sym, "SL", price, now)
-			return
+		slLine := st.entry * (1 - slMove)
+		if h.slMarginPct > 0 && st.entry > 0 {
+			if price <= slLine {
+				st.slBelowCnt++
+				need := h.slConfirmTicks
+				if need < 1 {
+					need = 1
+				}
+				if st.slBelowCnt >= need {
+					st.slBelowCnt = 0
+					h.triggerClose(st, sym, "SL", price, now)
+					return
+				}
+			} else {
+				st.slBelowCnt = 0
+			}
 		}
 		// Фиксация плюса «как трейдер»: net после комиссии в модели ≥ порога — не ждать редкого TP и отката.
 		if h.bankNetUSDT > 0 && netEst >= h.bankNetUSDT &&
@@ -859,6 +876,7 @@ func (st *symState) openSim(price float64, now time.Time) {
 	st.openedAt = now
 	st.peakPx = price
 	st.trailArmed = false
+	st.slBelowCnt = 0
 	st.flashBuf = st.flashBuf[:0]
 }
 
@@ -1021,6 +1039,7 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 	st.notional = effNotional
 	st.peakPx = st.entry
 	st.trailArmed = false
+	st.slBelowCnt = 0
 	st.flashBuf = st.flashBuf[:0]
 	h.openCnt.Add(1)
 	log.Printf("[%s] открыт лонг qty=%.8f avg=%.8f плечо=%d×", sym, q, st.entry, useLev)
@@ -1305,6 +1324,13 @@ func main() {
 
 	tpMove := priceMoveForMarginPct(tpm, lev)
 	slMove := priceMoveForMarginPct(slm, lev)
+	slConfirm := envGetInt(em, "SL_CONFIRM_TICKS", 1)
+	if slConfirm < 1 {
+		slConfirm = 1
+	}
+	if slConfirm > 15 {
+		slConfirm = 15
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -1564,6 +1590,7 @@ func main() {
 		maxSessionLossUSDT:     maxSessLoss,
 		minAvailToTrade:        minAvailTrade,
 		maxConsecLosses:        maxConsecLoss,
+		slConfirmTicks:         slConfirm,
 	}
 
 	if liveTrading {
@@ -1682,8 +1709,8 @@ func main() {
 	if h.live {
 		modeStr = fmt.Sprintf("ЛАЙВ (max поз=%d)", liveMaxPos)
 	}
-	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
-		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100)
+	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%) | SL подряд %d тик(а)",
+		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100, slConfirm)
 	scratchStr := "выкл"
 	if scratchDur > 0 {
 		scratchStr = fmt.Sprintf("первые %s", scratchDur.String())
