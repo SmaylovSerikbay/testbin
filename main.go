@@ -482,6 +482,7 @@ type hub struct {
 	trailFeeExtra    float64       // сверх оценки round-trip комиссии для включения трейла (доля)
 	trailMinNetUSDT  float64       // TRAIL только если оценка net PnL ≥ этого (не фиксировать «трейл» в минус)
 	bankNetUSDT      float64       // 0 = выкл; закрыть лонг при net ≥ (зафиксировать плюс, не ждать TP)
+	bankMarginPct    float64       // 0 = выкл; то же в % от маржи (как «% на $1» в логе), срабатывает раньше жадного TP
 	bankMinHold      time.Duration // мин. время в позиции перед BANK (0 = сразу)
 
 	// резкий «слив» после накачки: окно мини-тикера (часто ~1 с), быстрее обычного SL
@@ -611,11 +612,15 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 				st.slBelowCnt = 0
 			}
 		}
-		// Фиксация плюса «как трейдер»: net после комиссии в модели ≥ порога — не ждать редкого TP и отката.
-		if h.bankNetUSDT > 0 && netEst >= h.bankNetUSDT &&
-			(h.bankMinHold <= 0 || now.Sub(st.openedAt) >= h.bankMinHold) {
-			h.triggerClose(st, sym, "BANK", price, now)
-			return
+		// Фиксация плюса: либо net USDT, либо % на маржу (как в логе) — что наступит раньше после bankMinHold.
+		bankHoldOK := h.bankMinHold <= 0 || now.Sub(st.openedAt) >= h.bankMinHold
+		if bankHoldOK {
+			bankHit := (h.bankNetUSDT > 0 && netEst >= h.bankNetUSDT) ||
+				(h.bankMarginPct > 0 && h.marginUSDT > 1e-12 && netEst/h.marginUSDT*100 >= h.bankMarginPct)
+			if bankHit {
+				h.triggerClose(st, sym, "BANK", price, now)
+				return
+			}
 		}
 		if h.scratchDur > 0 && now.Sub(st.openedAt) < h.scratchDur &&
 			(h.scratchMinDur <= 0 || now.Sub(st.openedAt) >= h.scratchMinDur) &&
@@ -1324,13 +1329,6 @@ func main() {
 
 	tpMove := priceMoveForMarginPct(tpm, lev)
 	slMove := priceMoveForMarginPct(slm, lev)
-	slConfirm := envGetInt(em, "SL_CONFIRM_TICKS", 1)
-	if slConfirm < 1 {
-		slConfirm = 1
-	}
-	if slConfirm > 15 {
-		slConfirm = 15
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -1356,6 +1354,20 @@ func main() {
 		if pticks > 25 {
 			pticks = 25
 		}
+	}
+	var slConfirm int
+	if strings.TrimSpace(envGet(em, "SL_CONFIRM_TICKS", "")) != "" {
+		slConfirm = envGetInt(em, "SL_CONFIRM_TICKS", 1)
+	} else if liveTrading {
+		slConfirm = 2
+	} else {
+		slConfirm = 1
+	}
+	if slConfirm < 1 {
+		slConfirm = 1
+	}
+	if slConfirm > 15 {
+		slConfirm = 15
 	}
 	dbg := strings.TrimSpace(envGet(em, "PUMP_DEBUG", "")) == "1"
 
@@ -1479,6 +1491,10 @@ func main() {
 	if bankNet < 0 {
 		bankNet = 0
 	}
+	bankMarginPct := envGetFloat(em, "PUMP_BANK_MARGIN_PCT", 0)
+	if bankMarginPct < 0 {
+		bankMarginPct = 0
+	}
 	bankMinSec := envGetInt(em, "PUMP_BANK_MIN_SEC", 0)
 	var bankMinHold time.Duration
 	if bankMinSec > 0 {
@@ -1582,6 +1598,7 @@ func main() {
 		trailFeeExtra:          trailFeeExtra,
 		trailMinNetUSDT:        trailMinNet,
 		bankNetUSDT:            bankNet,
+		bankMarginPct:          bankMarginPct,
 		bankMinHold:            bankMinHold,
 		flashWindow:            flashWindow,
 		flashDropFrac:          flashDrop,
@@ -1725,11 +1742,17 @@ func main() {
 			flashWindow, flashDrop*100, flashSlope*100, flashMinSpan)
 	}
 	bankStr := "выкл"
-	if bankNet > 0 {
+	if bankNet > 0 || bankMarginPct > 0 {
+		switch {
+		case bankNet > 0 && bankMarginPct > 0:
+			bankStr = fmt.Sprintf("net≥%.4f USDT или ROI на маржу ≥%.1f%%", bankNet, bankMarginPct)
+		case bankNet > 0:
+			bankStr = fmt.Sprintf("net≥%.4f USDT", bankNet)
+		default:
+			bankStr = fmt.Sprintf("ROI на маржу ≥%.1f%%", bankMarginPct)
+		}
 		if bankMinHold > 0 {
-			bankStr = fmt.Sprintf("net≥%.4f USDT (модель), не раньше %v в позиции", bankNet, bankMinHold.Truncate(time.Second))
-		} else {
-			bankStr = fmt.Sprintf("net≥%.4f USDT (модель)", bankNet)
+			bankStr += fmt.Sprintf(", не раньше %v в позиции", bankMinHold.Truncate(time.Second))
 		}
 	}
 	trailTightNote := ""
