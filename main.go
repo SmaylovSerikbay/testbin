@@ -468,10 +468,12 @@ type hub struct {
 	liveMarginFrac float64
 
 	// выход «под памп»: быстрый scratch, трейлинг от пика, комиссия в пороге трейла
-	scratchDur    time.Duration // 0 = выкл
-	scratchPull   float64       // доля цены: ниже входа на столько — «не угадали памп»
-	trailBack     float64       // откат от peakPx для фиксации
-	trailFeeExtra float64       // сверх оценки round-trip комиссии для включения трейла (доля)
+	scratchDur      time.Duration // 0 = выкл
+	scratchMinDur   time.Duration // не раньше N в позиции (антимикрошум)
+	scratchPull     float64       // доля цены: ниже входа на столько — «не угадали памп»
+	trailBack       float64       // откат от peakPx для фиксации
+	trailFeeExtra   float64       // сверх оценки round-trip комиссии для включения трейла (доля)
+	trailMinNetUSDT float64       // TRAIL только если оценка net PnL ≥ этого (не фиксировать «трейл» в минус)
 
 	// резкий «слив» после накачки: окно мини-тикера (часто ~1 с), быстрее обычного SL
 	flashWindow    time.Duration // 0 = выкл
@@ -574,14 +576,18 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			h.triggerClose(st, sym, "TIME", price, now)
 			return
 		}
-		if h.scratchDur > 0 && now.Sub(st.openedAt) < h.scratchDur && !st.trailArmed &&
-			st.peakPx < st.entry*(1+trailOnFrac) && price <= st.entry*(1-h.scratchPull) {
+		if h.scratchDur > 0 && now.Sub(st.openedAt) < h.scratchDur &&
+			(h.scratchMinDur <= 0 || now.Sub(st.openedAt) >= h.scratchMinDur) &&
+			!st.trailArmed && st.peakPx < st.entry*(1+trailOnFrac) && price <= st.entry*(1-h.scratchPull) {
 			h.triggerClose(st, sym, "SCRATCH", price, now)
 			return
 		}
 		if st.trailArmed && st.peakPx > 0 && price <= st.peakPx*(1-h.trailBack) {
-			h.triggerClose(st, sym, "TRAIL", price, now)
-			return
+			netEst := st.qty*(price-st.entry) - h.feeRT*st.notional
+			if netEst >= h.trailMinNetUSDT {
+				h.triggerClose(st, sym, "TRAIL", price, now)
+				return
+			}
 		}
 		if price >= st.entry*tpFrac {
 			h.triggerClose(st, sym, "TP", price, now)
@@ -1333,6 +1339,14 @@ func main() {
 	if scratchPull == 0 && scratchDur > 0 {
 		scratchPull = 0.003
 	}
+	scratchMinSec := envGetInt(em, "PUMP_SCRATCH_MIN_SEC", 3)
+	var scratchMinDur time.Duration
+	if scratchMinSec > 0 {
+		scratchMinDur = time.Duration(scratchMinSec) * time.Second
+	}
+	if scratchDur > 0 && scratchMinDur > 0 && scratchMinDur >= scratchDur {
+		scratchMinDur = 0
+	}
 	trailBack := envGetFloat(em, "PUMP_TRAIL_BACK_PCT", 0.45) / 100
 	if trailBack <= 0 {
 		trailBack = 0.0045
@@ -1340,6 +1354,10 @@ func main() {
 	trailFeeExtra := envGetFloat(em, "PUMP_TRAIL_FEE_EXTRA_PCT", 0.06) / 100
 	if trailFeeExtra < 0 {
 		trailFeeExtra = 0
+	}
+	trailMinNet := envGetFloat(em, "PUMP_TRAIL_MIN_NET_USDT", 0.02)
+	if trailMinNet < 0 {
+		trailMinNet = 0
 	}
 
 	flashMs := envGetInt(em, "PUMP_FLASH_MS", 1200)
@@ -1427,10 +1445,12 @@ func main() {
 		liveMaxPos:       liveMaxPos,
 		levInt:           levInt,
 		liveMarginFrac:   liveMarginFrac,
-		scratchDur:       scratchDur,
-		scratchPull:        scratchPull,
-		trailBack:          trailBack,
-		trailFeeExtra:      trailFeeExtra,
+		scratchDur:        scratchDur,
+		scratchMinDur:     scratchMinDur,
+		scratchPull:       scratchPull,
+		trailBack:         trailBack,
+		trailFeeExtra:     trailFeeExtra,
+		trailMinNetUSDT:   trailMinNet,
 		flashWindow:        flashWindow,
 		flashDropFrac:      flashDrop,
 		flashSlopeFrac:     flashSlope,
@@ -1548,15 +1568,19 @@ func main() {
 		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100)
 	scratchStr := "выкл"
 	if scratchDur > 0 {
-		scratchStr = fmt.Sprintf("первые %s, ниже входа на ≥%.2f%% без «подтверждения»", scratchDur.String(), scratchPull*100)
+		scratchStr = fmt.Sprintf("первые %s", scratchDur.String())
+		if scratchMinDur > 0 {
+			scratchStr += fmt.Sprintf(", не раньше %v в позиции", scratchMinDur)
+		}
+		scratchStr += fmt.Sprintf(", ниже входа на ≥%.2f%% без подтверждения", scratchPull*100)
 	}
 	flashStr := "выкл"
 	if flashWindow > 0 {
 		flashStr = fmt.Sprintf("окно %v: просадка от max в окне ≥%.2f%% или наклон ≥%.2f%% за ≥%v",
 			flashWindow, flashDrop*100, flashSlope*100, flashMinSpan)
 	}
-	log.Printf("Выход по позиции: FLASH=%s | SCRATCH=%s | TRAIL: откат от пика ≥%.2f%% после роста ≥ round-trip комиссия + %.3f%% | TP-потолок +%.4f%% | SL −%.4f%%",
-		flashStr, scratchStr, trailBack*100, trailFeeExtra*100, tpMove*100, slMove*100)
+	log.Printf("Выход по позиции: FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%% от пика и net≥%.4f USDT (после комиссии в модели) | TP +%.4f%% | SL −%.4f%%",
+		flashStr, scratchStr, trailBack*100, trailMinNet, tpMove*100, slMove*100)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
