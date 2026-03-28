@@ -570,6 +570,7 @@ type hub struct {
 	aggRejLOF    atomic.Uint64
 	aggRejSingle atomic.Uint64
 	aggRejVwap   atomic.Uint64
+	aggRejHtfWait atomic.Uint64 // лайв: все agg ок, но символ в паузе после отказа HTF
 
 	miniEntry bool // открывать ли позицию по мини-тикеру (если false — только agg)
 
@@ -1063,6 +1064,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 			return
 		}
 		if h.htfFilter > 0 && h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+			h.aggRejHtfWait.Add(1)
 			return
 		}
 		h.aggPassLive.Add(1)
@@ -1736,7 +1738,8 @@ func main() {
 	if aggMinHlRg < 0 {
 		aggMinHlRg = 0
 	}
-	if liveTrading {
+	// Если база 0 — фильтр выкл; не добавлять LIVE add (иначе «0» в .env всё равно даёт ~0.008%).
+	if liveTrading && aggMinHlRg > 0 {
 		aggMinHlRg += envGetFloat(em, "LIVE_AGG_HIGH_LOW_ADD_PCT", 0)
 	}
 	if aggMinHlRg < 0 {
@@ -2184,8 +2187,9 @@ func main() {
 					rlf := h.aggRejLOF.Swap(0)
 					rs := h.aggRejSingle.Swap(0)
 					rvw := h.aggRejVwap.Swap(0)
-					aggBlk := fmt.Sprintf(" | agg→лайв: %d | отсев quote=%d move=%d HL=%d peak=%d qual=%d 1st→last=%d single=%d vwap=%d",
-						ap, rq, rm, rhl, rpk, rqual, rlf, rs, rvw)
+					rht := h.aggRejHtfWait.Swap(0)
+					aggBlk := fmt.Sprintf(" | agg→лайв: %d | отсев quote=%d move=%d HL=%d peak=%d qual=%d 1st→last=%d single=%d vwap=%d htf_wait=%d",
+						ap, rq, rm, rhl, rpk, rqual, rlf, rs, rvw, rht)
 					if err != nil {
 						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s%s | баланс: %v",
 							h.closedTrades.Load(), pnl, blk, aggBlk, err)
