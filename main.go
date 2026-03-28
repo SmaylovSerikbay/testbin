@@ -1935,6 +1935,15 @@ func main() {
 	if liveTrading && aggMinHlRg > 0 {
 		aggMinHlRg += envGetFloat(em, "LIVE_AGG_HIGH_LOW_ADD_PCT", 0)
 	}
+	// Лайв: нижняя граница размаха (max−min)/min в окне agg, даже если AGG_MIN_HIGH_LOW_RANGE_PCT=0.
+	// Иначе достаточно «дёрганья» last от локального min за 800ms — после входа монета может встать (нет требования ширины свечи).
+	liveHlFloor := envGetFloat(em, "LIVE_AGG_MIN_HIGH_LOW_RANGE_PCT", 0)
+	if liveHlFloor < 0 {
+		liveHlFloor = 0
+	}
+	if liveTrading && liveHlFloor > 0 && aggMinHlRg < liveHlFloor {
+		aggMinHlRg = liveHlFloor
+	}
 	if aggMinHlRg < 0 {
 		aggMinHlRg = 0
 	}
