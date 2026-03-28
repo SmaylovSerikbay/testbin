@@ -499,7 +499,8 @@ type hub struct {
 	maxConsecLosses    int     // подряд убыточных сделок (0 = выкл)
 	consecLoss         atomic.Int32
 
-	slConfirmTicks int // SL только после N подряд тиков ≤ линии стопа (1 = как раньше)
+	slConfirmTicks int     // SL только после N подряд тиков ≤ линии стопа (1 = как раньше)
+	cutMarginPct   float64 // 0 = выкл; немедленный выход при ROI на маржу ≤ −X% (модель), без ожидания N тиков SL
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -645,7 +646,21 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 				return
 			}
 		}
+		// Медленный слив: SL ждёт N тиков подряд, а убыток в модели уже большой — режем за один тик.
+		if h.cutMarginPct > 0 && h.marginUSDT > 1e-12 && netEst < 0 {
+			if netEst/h.marginUSDT*100 <= -h.cutMarginPct {
+				st.slBelowCnt = 0
+				h.triggerClose(st, sym, "CUT", price, now)
+				return
+			}
+		}
 		if h.maxHold > 0 && now.Sub(st.openedAt) >= h.maxHold {
+			// Уже за линией SL, но не хватило второго тика — не метить TIME (хуже смысл и тот же MARKET).
+			if h.slMarginPct > 0 && st.entry > 0 && price <= slLine {
+				st.slBelowCnt = 0
+				h.triggerClose(st, sym, "SL", price, now)
+				return
+			}
 			h.triggerClose(st, sym, "TIME", price, now)
 			return
 		}
@@ -1338,6 +1353,10 @@ func main() {
 	tpm := envGetFloat(em, "TP_MARGIN_PCT", tpMarginPct)
 	slm := envGetFloat(em, "SL_MARGIN_PCT", slMarginPct)
 	fee := envGetFloat(em, "FEE_ROUND_TRIP", feeRoundTrip)
+	cutMg := envGetFloat(em, "PUMP_CUT_MARGIN_PCT", 0)
+	if cutMg < 0 {
+		cutMg = 0
+	}
 
 	tpMove := priceMoveForMarginPct(tpm, lev)
 	slMove := priceMoveForMarginPct(slm, lev)
@@ -1631,6 +1650,7 @@ func main() {
 		minAvailToTrade:        minAvailTrade,
 		maxConsecLosses:        maxConsecLoss,
 		slConfirmTicks:         slConfirm,
+		cutMarginPct:           cutMg,
 	}
 
 	if liveTrading {
@@ -1790,8 +1810,12 @@ func main() {
 		}
 		trailTightNote = fmt.Sprintf("; при net≥%.4f → откат ≥%.2f%%", tnm, trailBackTight*100)
 	}
-	log.Printf("Выход по позиции: BANK=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%",
-		bankStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100)
+	cutStr := "выкл"
+	if cutMg > 0 {
+		cutStr = fmt.Sprintf("ROI≤−%.1f%% на маржу (модель), один тик", cutMg)
+	}
+	log.Printf("Выход по позиции: CUT=%s | BANK=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%; по TIME если цена≤SL — всё равно SL",
+		cutStr, bankStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
