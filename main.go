@@ -264,6 +264,7 @@ type symState struct {
 	lastSignalAt time.Time
 	opening      bool // в процессе выставления лайв-ордера
 	closing      bool // в процессе закрытия лайв-ордера
+	posLev       int  // фактическое плечо лайв-позиции (0 = симуляция / не задано)
 
 	retBuf   []float64 // кольцо: % изменения цены за тик (~1 с)
 	dqBuf    []float64 // кольцо: Δq USDT за тик; 0 = нет данных за эту секунду
@@ -377,9 +378,9 @@ type hub struct {
 	cooldown     time.Duration
 	histLen      int
 
-	tpPriceFrac  float64
-	slPriceFrac  float64
-	feeRT        float64
+	tpMarginPct float64 // из .env — для TP/SL по цене с учётом плеча
+	slMarginPct float64
+	feeRT       float64
 	marginUSDT   float64
 	notionalUSDT float64
 	totalPnL     atomic.Uint64 // bits of float64
@@ -467,6 +468,13 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 		if h.live && st.closing {
 			return
 		}
+		levM := float64(h.levInt)
+		if st.posLev > 0 {
+			levM = float64(st.posLev)
+		}
+		tpMove := priceMoveForMarginPct(h.tpMarginPct, levM)
+		slMove := priceMoveForMarginPct(h.slMarginPct, levM)
+		tpFrac := 1 + tpMove
 		if h.maxHold > 0 && now.Sub(st.openedAt) >= h.maxHold {
 			if h.live {
 				if st.closing {
@@ -480,7 +488,7 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			h.closeTrade(st, sym, "TIME", price, pnl, now)
 			return
 		}
-		if price >= st.entry*h.tpPriceFrac {
+		if price >= st.entry*tpFrac {
 			if h.live {
 				if st.closing {
 					return
@@ -493,7 +501,7 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			h.closeTrade(st, sym, "TP", price, pnl, now)
 			return
 		}
-		if price <= st.entry*(1-h.slPriceFrac) {
+		if price <= st.entry*(1-slMove) {
 			if h.live {
 				if st.closing {
 					return
@@ -725,6 +733,7 @@ func (h *hub) closeTrade(st *symState, sym, reason string, exitPrice float64, pn
 	st.inPos = false
 	st.entry = 0
 	st.qty = 0
+	st.posLev = 0
 	st.pumpArmCnt = 0
 }
 
@@ -740,7 +749,8 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		st.mu.Unlock()
 		return
 	}
-	if err := h.fapi.ensureLeverage(ctx, sym, h.levInt); err != nil {
+	useLev, err := h.fapi.ensureLeverage(ctx, sym, h.levInt, h.notionalUSDT)
+	if err != nil {
 		h.restMu.Unlock()
 		st.mu.Lock()
 		st.opening = false
@@ -748,7 +758,12 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		log.Printf("[%s] leverage: %v", sym, err)
 		return
 	}
-	qtyStr, _, err := h.fapi.PrepareQtyBuy(sym, h.notionalUSDT, refPrice)
+	if useLev != h.levInt {
+		log.Printf("[%s] плечо по bracket: %d× (запрошено %d×), нотиoнал %.2f USDT",
+			sym, useLev, h.levInt, h.marginUSDT*float64(useLev))
+	}
+	effNotional := h.marginUSDT * float64(useLev)
+	qtyStr, _, err := h.fapi.PrepareQtyBuy(sym, effNotional, refPrice)
 	if err != nil {
 		h.restMu.Unlock()
 		st.mu.Lock()
@@ -775,8 +790,9 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 	}
 	st.qty = q
 	st.openedAt = now
+	st.posLev = useLev
 	h.openCnt.Add(1)
-	log.Printf("[%s] открыт лонг qty=%.8f avg=%.8f", sym, q, st.entry)
+	log.Printf("[%s] открыт лонг qty=%.8f avg=%.8f плечо=%d×", sym, q, st.entry, useLev)
 }
 
 func (h *hub) doCloseAsync(sym string, st *symState, reason string, markPrice float64, now time.Time) {
@@ -1143,8 +1159,8 @@ func main() {
 		maxPumpPct:    maxPump,
 		cooldown:      cd,
 		histLen:       histLen,
-		tpPriceFrac:   1 + tpMove,
-		slPriceFrac:   slMove,
+		tpMarginPct:   tpm,
+		slMarginPct:   slm,
 		feeRT:         fee,
 		marginUSDT:    m,
 		notionalUSDT:  m * lev,
