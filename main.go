@@ -561,6 +561,14 @@ type hub struct {
 
 	// За интервал STATS: сколько раз agg прошёл все фильтры и запущен лайв-вход (до HTF/ордера).
 	aggPassLive atomic.Uint64
+	// Диагностика: первый непройденный фильтр после quote+move (Swap в STATS).
+	aggRejBase   atomic.Uint64 // sumQ или min→last move
+	aggRejHL     atomic.Uint64
+	aggRejPeak   atomic.Uint64
+	aggRejQual   atomic.Uint64
+	aggRejLOF    atomic.Uint64
+	aggRejSingle atomic.Uint64
+	aggRejVwap   atomic.Uint64
 
 	miniEntry bool // открывать ли позицию по мини-тикеру (если false — только agg)
 
@@ -1006,34 +1014,42 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 	}
 	movePct := (lastQual - minP) / minP * 100
 	if sumQ < h.aggMinQuote || movePct < h.aggMinMovePct || lastQual <= minP {
+		h.aggRejBase.Add(1)
 		return
 	}
 	hlRangePct := (maxP - minP) / minP * 100
 	if h.aggMinHighLowRangePct > 0 && hlRangePct < h.aggMinHighLowRangePct {
+		h.aggRejHL.Add(1)
 		return
 	}
 	if h.aggNearPeakFrac > 0 && lastQual < maxP*(1-h.aggNearPeakFrac) {
+		h.aggRejPeak.Add(1)
 		return
 	}
 	if h.aggMinQualTrades > 0 && qualN < h.aggMinQualTrades {
+		h.aggRejQual.Add(1)
 		return
 	}
 	if h.aggMinLastOverFirstPct > 0 && firstQual > 0 {
 		lof := (lastQual - firstQual) / firstQual * 100
 		if lof < h.aggMinLastOverFirstPct {
+			h.aggRejLOF.Add(1)
 			return
 		}
 	}
 	if h.aggMinSingleTradeUSDT > 0 && maxSingleQ < h.aggMinSingleTradeUSDT {
+		h.aggRejSingle.Add(1)
 		return
 	}
 	if h.aggMinLastOverVwapPct > 0 && baseVolSum > 0 && lastQual > 0 {
 		vwap := sumQ / baseVolSum
 		if vwap <= 0 {
+			h.aggRejVwap.Add(1)
 			return
 		}
 		overVwapPct := (lastQual - vwap) / vwap * 100
 		if overVwapPct < h.aggMinLastOverVwapPct {
+			h.aggRejVwap.Add(1)
 			return
 		}
 	}
@@ -2155,7 +2171,15 @@ func main() {
 						blk = " | ВХОДЫ ЗАБЛОКИРОВАНЫ (страховка)"
 					}
 					ap := h.aggPassLive.Swap(0)
-					aggBlk := fmt.Sprintf(" | agg→лайв за интервал: %d", ap)
+					rb := h.aggRejBase.Swap(0)
+					rhl := h.aggRejHL.Swap(0)
+					rpk := h.aggRejPeak.Swap(0)
+					rq := h.aggRejQual.Swap(0)
+					rlf := h.aggRejLOF.Swap(0)
+					rs := h.aggRejSingle.Swap(0)
+					rvw := h.aggRejVwap.Swap(0)
+					aggBlk := fmt.Sprintf(" | agg→лайв: %d | отсев base=%d HL=%d peak=%d qual=%d 1st→last=%d single=%d vwap=%d",
+						ap, rb, rhl, rpk, rq, rlf, rs, rvw)
 					if err != nil {
 						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s%s | баланс: %v",
 							h.closedTrades.Load(), pnl, blk, aggBlk, err)
