@@ -471,6 +471,7 @@ func parseMiniPayload(raw []byte) (sym string, price float64, quoteVol float64, 
 		return "", 0, 0, false
 	}
 	sym, _ = m["s"].(string)
+	sym = normalizeFuturesSym(sym)
 	if sym == "" {
 		return "", 0, 0, false
 	}
@@ -499,6 +500,7 @@ func parseAggPayload(raw []byte) (sym string, price, qty float64, buyerMaker boo
 		return "", 0, 0, false, 0, false
 	}
 	sym, _ = m["s"].(string)
+	sym = normalizeFuturesSym(sym)
 	p, okp := parseFloatish(m["p"])
 	q, okq := parseFloatish(m["q"])
 	if !okp || !okq || sym == "" || p <= 0 || q <= 0 {
@@ -593,6 +595,10 @@ type hub struct {
 	htfFilter       int           // 0=выкл; 1=последняя закрытая бычья (C>O); 2=close>prev close; 3=оба
 	htfInterval     string        // 1m, 5m, …
 	htfFailCooldown time.Duration // пауза на символ после отказа HTF (меньше REST и строк в логе)
+
+	// «пропуск HTF» не чаще одного раза за интервал (на символ), даже если кулдаун на symState сбился.
+	htfSkipLogMu sync.Mutex
+	htfSkipLogAt map[string]time.Time
 
 	maxHold time.Duration
 
@@ -695,7 +701,41 @@ func htfSymCooldownActive(now, until time.Time, failCD time.Duration) bool {
 	return failCD > 0 && !until.IsZero() && !now.Before(until)
 }
 
+// liveSymCooldownDur — длительность паузы символа после отказа HTF / ошибки подготовки qty.
+// Если в env 0 — минимум 2s (иначе шторм REST и сотни строк «пропуск HTF» в секунду).
+func (h *hub) liveSymCooldownDur() time.Duration {
+	if h.htfFailCooldown > 0 {
+		return h.htfFailCooldown
+	}
+	return 2 * time.Second
+}
+
+func normalizeFuturesSym(sym string) string {
+	return strings.ToUpper(strings.TrimSpace(sym))
+}
+
+func (h *hub) logHTFReject(sym, why string, sim bool) {
+	gap := h.liveSymCooldownDur()
+	h.htfSkipLogMu.Lock()
+	if h.htfSkipLogAt == nil {
+		h.htfSkipLogAt = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if t, ok := h.htfSkipLogAt[sym]; ok && now.Sub(t) < gap {
+		h.htfSkipLogMu.Unlock()
+		return
+	}
+	h.htfSkipLogAt[sym] = now
+	h.htfSkipLogMu.Unlock()
+	if sim {
+		log.Printf("[%s] симуляция: пропуск HTF: %s", sym, why)
+	} else {
+		log.Printf("[%s] пропуск HTF: %s", sym, why)
+	}
+}
+
 func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now time.Time) {
+	sym = normalizeFuturesSym(sym)
 	v, _ := h.states.LoadOrStore(sym, newSymState(h.notionalUSDT, h.histLen))
 	st := v.(*symState)
 
@@ -930,7 +970,7 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			if h.entriesPaused.Load() || st.opening || st.inPos {
 				return
 			}
-			if h.htfFilter > 0 && htfSymCooldownActive(now, st.htfCooldownUntil, h.htfFailCooldown) {
+			if htfSymCooldownActive(now, st.htfCooldownUntil, h.liveSymCooldownDur()) {
 				return
 			}
 			st.opening = true
@@ -941,7 +981,7 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			return
 		}
 		if h.htfFilter > 0 {
-			if htfSymCooldownActive(now, st.htfCooldownUntil, h.htfFailCooldown) {
+			if htfSymCooldownActive(now, st.htfCooldownUntil, h.liveSymCooldownDur()) {
 				return
 			}
 			st.opening = true
@@ -957,6 +997,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 	if !h.aggEnabled {
 		return
 	}
+	sym = normalizeFuturesSym(sym)
 	v, _ := h.states.LoadOrStore(sym, newSymState(h.notionalUSDT, h.histLen))
 	st := v.(*symState)
 
@@ -1070,7 +1111,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		if h.entriesPaused.Load() || st.opening || st.inPos {
 			return
 		}
-		if h.htfFilter > 0 && htfSymCooldownActive(now, st.htfCooldownUntil, h.htfFailCooldown) {
+		if htfSymCooldownActive(now, st.htfCooldownUntil, h.liveSymCooldownDur()) {
 			h.aggRejHtfWait.Add(1)
 			return
 		}
@@ -1083,7 +1124,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		return
 	}
 	if h.htfFilter > 0 {
-		if htfSymCooldownActive(now, st.htfCooldownUntil, h.htfFailCooldown) {
+		if htfSymCooldownActive(now, st.htfCooldownUntil, h.liveSymCooldownDur()) {
 			return
 		}
 		st.opening = true
@@ -1186,10 +1227,8 @@ func (h *hub) doOpenSimAfterHTF(sym string, st *symState, ref float64, now time.
 	defer st.mu.Unlock()
 	st.opening = false
 	if !ok {
-		if h.htfFailCooldown > 0 {
-			st.htfCooldownUntil = time.Now().Add(h.htfFailCooldown)
-		}
-		log.Printf("[%s] симуляция: пропуск HTF: %s", sym, why)
+		st.htfCooldownUntil = time.Now().Add(h.liveSymCooldownDur())
+		h.logHTFReject(sym, why, true)
 		return
 	}
 	if st.inPos {
@@ -1214,11 +1253,9 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		if ok, why := h.checkHTFLong(ctx, sym); !ok {
 			st.mu.Lock()
 			st.opening = false
-			if h.htfFailCooldown > 0 {
-				st.htfCooldownUntil = time.Now().Add(h.htfFailCooldown)
-			}
+			st.htfCooldownUntil = time.Now().Add(h.liveSymCooldownDur())
 			st.mu.Unlock()
-			log.Printf("[%s] пропуск HTF: %s", sym, why)
+			h.logHTFReject(sym, why, false)
 			return
 		}
 	}
@@ -1284,9 +1321,7 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		h.restMu.Unlock()
 		st.mu.Lock()
 		st.opening = false
-		if h.htfFailCooldown > 0 {
-			st.htfCooldownUntil = time.Now().Add(h.htfFailCooldown)
-		}
+		st.htfCooldownUntil = time.Now().Add(h.liveSymCooldownDur())
 		st.mu.Unlock()
 		log.Printf("[%s] подготовка qty: %v", sym, err)
 		return
@@ -2107,8 +2142,12 @@ func main() {
 	} else if htfF == 3 {
 		htfNote = fmt.Sprintf("HTF %s: бычья + close↑ (оба)", htfIv)
 	}
-	if htfF > 0 && htfFailCooldown > 0 {
-		htfNote += fmt.Sprintf("; пауза после отказа %v", htfFailCooldown.Truncate(time.Second))
+	if htfF > 0 {
+		effCD := htfFailCooldown
+		if effCD <= 0 {
+			effCD = 2 * time.Second
+		}
+		htfNote += fmt.Sprintf("; пауза символа после отказа %v", effCD.Truncate(time.Second))
 	}
 	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%) | SL подряд %d тик(а)",
 		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, htfNote, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100, slConfirm)
