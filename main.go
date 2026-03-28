@@ -626,6 +626,9 @@ type hub struct {
 	scratchDur       time.Duration // 0 = выкл
 	scratchMinDur    time.Duration // не раньше N в позиции (антимикрошум)
 	scratchPull      float64       // доля цены: ниже входа на столько — «не угадали памп»
+	// NOPUMP: через N с пик так и не выше входа на minPeak% по цене — выход (комиссии неизбежны; цель — не тянуть до TIME/SL).
+	nopumpExitDur    time.Duration // 0 = выкл
+	nopumpMinPeakFrac float64      // доля цены: peakPx >= entry×(1+frac) считаем «был импульс», иначе после nopumpExitDur закрываем
 	trailBack        float64       // откат от peakPx для фиксации
 	trailBackTight   float64       // 0 = выкл; уже откат, если net уже в хорошем плюсе (фиксация жадности)
 	trailTightMinNet float64       // порог net USDT для включения trailBackTight (0 → как trailMinNetUSDT)
@@ -868,6 +871,13 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 				(h.bankMarginPct > 0 && effMar > 1e-12 && netEst >= bankBuf && netEst/effMar*100 >= h.bankMarginPct)
 			if bankHit {
 				h.triggerClose(st, sym, "BANK", pxEval, now)
+				return
+			}
+		}
+		// Нет «пампа» по цене: к пику не набрали даже минимальный ход от входа — выходим до глубокого минуса по TIME.
+		if h.nopumpExitDur > 0 && st.entry > 0 && now.Sub(st.openedAt) >= h.nopumpExitDur {
+			if st.peakPx < st.entry*(1+h.nopumpMinPeakFrac) {
+				h.triggerClose(st, sym, "NOPUMP", pxEval, now)
 				return
 			}
 		}
@@ -1458,6 +1468,87 @@ func (h *hub) doCloseAsync(sym string, st *symState, reason string, markPrice fl
 	h.openCnt.Add(-1)
 }
 
+// adoptOpenPositionsFromExchange — после перезапуска подхватывает открытые лонги с биржи, иначе inPos=false
+// и SL/TP/TIME не работают, пока позиция «сиротская». Шорты и символы вне пула WS только логируются.
+func (h *hub) adoptOpenPositionsFromExchange(ctx context.Context, pool map[string]struct{}) {
+	if h.fapi == nil || !h.live {
+		return
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	rows, err := h.fapi.PositionRisk(ctx2)
+	if err != nil {
+		log.Printf("синхронизация позиций с биржей: %v", err)
+		return
+	}
+	now := time.Now()
+	adopted := 0
+	for _, row := range rows {
+		sym := normalizeFuturesSym(row.Symbol)
+		amt, _ := strconv.ParseFloat(row.PositionAmt, 64)
+		if math.Abs(amt) < 1e-12 {
+			continue
+		}
+		if amt < 0 {
+			log.Printf("[%s] ВНИМАНИЕ: на бирже шорт (amt=%.8f) — бот только лонг. Закройте вручную.", sym, amt)
+			continue
+		}
+		if _, ok := pool[sym]; !ok {
+			entry, _ := strconv.ParseFloat(row.EntryPrice, 64)
+			log.Printf("[%s] ВНИМАНИЕ: лонг на бирже qty=%.8f entry≈%.8f — нет в пуле WS. Тики не приходят, SL/TP не считаются. Закройте вручную или расширьте universe (MIN_SYMBOLS).", sym, amt, entry)
+			continue
+		}
+		entry, _ := strconv.ParseFloat(row.EntryPrice, 64)
+		mark, _ := strconv.ParseFloat(row.MarkPrice, 64)
+		lev, _ := strconv.Atoi(strings.TrimSpace(row.Leverage))
+		if lev < 1 {
+			lev = h.levInt
+		}
+		v, _ := h.states.LoadOrStore(sym, newSymState(h.notionalUSDT, h.histLen))
+		st := v.(*symState)
+		st.mu.Lock()
+		if st.inPos {
+			st.mu.Unlock()
+			continue
+		}
+		st.inPos = true
+		st.entry = entry
+		if st.entry <= 0 && mark > 0 {
+			st.entry = mark
+		}
+		st.qty = amt
+		if st.entry > 0 {
+			st.notional = st.qty * st.entry
+		} else {
+			st.notional = h.notionalUSDT * float64(lev)
+		}
+		st.posLev = lev
+		st.openedAt = now
+		st.peakPx = st.entry
+		if mark > st.peakPx {
+			st.peakPx = mark
+		}
+		st.trailArmed = false
+		st.slBelowCnt = 0
+		st.flashBuf = st.flashBuf[:0]
+		st.opening = false
+		st.closing = false
+		qty := st.qty
+		ent := st.entry
+		ntl := st.notional
+		st.mu.Unlock()
+		h.openCnt.Add(1)
+		adopted++
+		log.Printf("[%s] синхронизация: принят лонг с биржи qty=%.8f entry=%.8f плечо=%d× нотиoнал≈%.2f — выходы по правилам снова активны", sym, qty, ent, lev, ntl)
+	}
+	if adopted > 0 {
+		log.Printf("синхронизация позиций: подхвачено лонгов=%d (TIME отсчитывается от старта бота; см. MAX_HOLD_SEC)", adopted)
+		if int(h.openCnt.Load()) > h.liveMaxPos {
+			log.Printf("синхронизация: открытых позиций %d > LIVE_MAX_POS=%d — новые входы блокируются до закрытия", h.openCnt.Load(), h.liveMaxPos)
+		}
+	}
+}
+
 func chunkStrings(in []string, n int) [][]string {
 	var out [][]string
 	for i := 0; i < len(in); i += n {
@@ -1758,6 +1849,8 @@ func main() {
 		pticks = 1
 	}
 	liveTrading := strings.TrimSpace(envGet(em, "LIVE_TRADING", "")) == "1"
+	// Подхват открытых лонгов с биржи после перезапуска (иначе SL/TP/TIME не работают).
+	liveSyncPositions := strings.TrimSpace(envGet(em, "LIVE_SYNC_POSITIONS", "1")) != "0"
 	if liveTrading {
 		pticks += envGetInt(em, "LIVE_PUMP_CONFIRM_TICKS_ADD", 0)
 		if pticks > 25 {
@@ -1911,6 +2004,20 @@ func main() {
 	if scratchDur > 0 && scratchMinDur > 0 && scratchMinDur >= scratchDur {
 		scratchMinDur = 0
 	}
+	nopumpSec := envGetInt(em, "PUMP_NOPUMP_EXIT_SEC", 0)
+	nopumpMinPeakPct := envGetFloat(em, "PUMP_NOPUMP_MIN_PEAK_PCT", 0.08)
+	if nopumpMinPeakPct < 0 {
+		nopumpMinPeakPct = 0
+	}
+	var nopumpDur time.Duration
+	if nopumpSec > 0 {
+		nopumpDur = time.Duration(nopumpSec) * time.Second
+		if nopumpMinPeakPct <= 0 {
+			nopumpMinPeakPct = 0.06
+		}
+	}
+	nopumpMinPeakFrac := nopumpMinPeakPct / 100
+
 	trailBack := envGetFloat(em, "PUMP_TRAIL_BACK_PCT", 0.45) / 100
 	if trailBack <= 0 {
 		trailBack = 0.0045
@@ -2048,6 +2155,8 @@ func main() {
 		scratchDur:             scratchDur,
 		scratchMinDur:          scratchMinDur,
 		scratchPull:            scratchPull,
+		nopumpExitDur:          nopumpDur,
+		nopumpMinPeakFrac:      nopumpMinPeakFrac,
 		trailBack:              trailBack,
 		trailBackTight:         trailBackTight,
 		trailTightMinNet:       trailTightMinNet,
@@ -2117,6 +2226,13 @@ func main() {
 
 	for _, s := range symbols {
 		h.states.Store(s, &symState{notional: m * lev})
+	}
+	if liveTrading && liveSyncPositions {
+		pool := make(map[string]struct{}, len(symbols))
+		for _, s := range symbols {
+			pool[normalizeFuturesSym(s)] = struct{}{}
+		}
+		h.adoptOpenPositionsFromExchange(ctx, pool)
 	}
 
 	batches := chunkStrings(symbols, streamsConn)
@@ -2220,6 +2336,10 @@ func main() {
 		}
 		scratchStr += fmt.Sprintf(", ниже входа на ≥%.2f%% без подтверждения", scratchPull*100)
 	}
+	nopumpStr := "выкл"
+	if nopumpDur > 0 {
+		nopumpStr = fmt.Sprintf("≥%v: пик < входа+%.3f%% (по цене) → выход", nopumpDur.Truncate(time.Second), nopumpMinPeakPct)
+	}
 	flashStr := "выкл"
 	if flashWindow > 0 {
 		flashStr = fmt.Sprintf("окно %v: просадка от max в окне ≥%.2f%% или наклон ≥%.2f%% за ≥%v",
@@ -2269,8 +2389,8 @@ func main() {
 	if liveTrading && exitUseMark {
 		exitMarkNote = " | лайв: выходы по mark (как PnL в приложении; кэш ~400ms)"
 	}
-	log.Printf("Выход по позиции: CAP=%s | CUT=%s | BANK=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%; TIME+цена≤SL→SL%s",
-		capStr, cutStr, bankStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100, exitMarkNote)
+	log.Printf("Выход по позиции: CAP=%s | CUT=%s | BANK=%s | NOPUMP=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%; TIME+цена≤SL→SL%s",
+		capStr, cutStr, bankStr, nopumpStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100, exitMarkNote)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()

@@ -538,6 +538,29 @@ func (c *fapiClient) getSigned(ctx context.Context, path string, params url.Valu
 }
 
 // FuturesUSDTBalance — кошелёк USDT-M (кросс): кошелёк и доступно для новых ордеров.
+// positionRiskRow — строка /fapi/v2/positionRisk (USDT-M).
+type positionRiskRow struct {
+	Symbol       string `json:"symbol"`
+	PositionAmt  string `json:"positionAmt"`
+	EntryPrice   string `json:"entryPrice"`
+	MarkPrice    string `json:"markPrice"`
+	PositionSide string `json:"positionSide"`
+	Leverage     string `json:"leverage"`
+}
+
+// PositionRisk — все открытые позиции (для синхронизации состояния бота с биржей после перезапуска).
+func (c *fapiClient) PositionRisk(ctx context.Context) ([]positionRiskRow, error) {
+	raw, err := c.getSigned(ctx, "/fapi/v2/positionRisk", url.Values{})
+	if err != nil {
+		return nil, err
+	}
+	var rows []positionRiskRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 func (c *fapiClient) FuturesUSDTBalance(ctx context.Context) (wallet, available float64, err error) {
 	raw, err := c.getSigned(ctx, "/fapi/v2/account", url.Values{})
 	if err != nil {
