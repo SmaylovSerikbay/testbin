@@ -1013,16 +1013,7 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		log.Printf("[%s] вход: кошелёк USDT-M=%.4f доступно=%.4f → маржа сделки≈%.4f нотиoнал≈%.2f",
 			sym, wallet, avail, effMargin, effNotional)
 	}
-	// Цена сигнала часто на хае: notional/ref даёт мало qty → у биржи notional < 5 (−4164). Берём min(ref, mark) с небольшим запасом.
-	pxForQty := refPrice
-	if mp, mpErr := h.fapi.MarkPrice(ctx, sym); mpErr == nil && mp > 0 {
-		pxForQty = math.Min(refPrice, mp)
-	}
-	pxForQty *= 0.9995
-	if pxForQty <= 0 {
-		pxForQty = refPrice
-	}
-	qtyStr, _, err := h.fapi.PrepareQtyBuy(sym, effNotional, pxForQty)
+	qtyStr, _, err := h.fapi.PrepareQtyBuyLive(ctx, sym, effNotional, refPrice)
 	if err != nil {
 		h.restMu.Unlock()
 		st.mu.Lock()
@@ -1040,7 +1031,7 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 	if err != nil {
 		msg := err.Error()
 		if strings.Contains(msg, "-4164") || strings.Contains(msg, "notional must be no smaller") {
-			log.Printf("[%s] market BUY: %v (часто: сигнал на хае last — qty мало для min 5 USDT; пробуем mark/min(ref,mark) в коде)", sym, err)
+			log.Printf("[%s] market BUY: %v (редко после PrepareQtyBuyLive — проверьте лимиты пары / нотиoнал)", sym, err)
 		} else if strings.Contains(msg, "-2019") || strings.Contains(msg, "insufficient") {
 			log.Printf("[%s] market BUY: %v (мало доступной маржи под IM — снизьте LIVE_MARGIN_BUFFER_PCT или MARGIN_USDT)", sym, err)
 		} else {

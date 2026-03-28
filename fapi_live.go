@@ -276,6 +276,101 @@ func formatQtyString(q float64, step float64) string {
 	return s
 }
 
+// BookTickerBid — публичный best bid (ниже last → больше qty при том же нотиoнале, меньше −4164).
+func (c *fapiClient) BookTickerBid(ctx context.Context, symbol string) (float64, error) {
+	u := c.base + "/fapi/v1/ticker/bookTicker?symbol=" + url.QueryEscape(symbol)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		sn := len(raw)
+		if sn > 200 {
+			sn = 200
+		}
+		return 0, fmt.Errorf("bookTicker HTTP %d: %s", resp.StatusCode, string(raw[:sn]))
+	}
+	var row struct {
+		BidPrice string `json:"bidPrice"`
+	}
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return 0, err
+	}
+	if row.BidPrice == "" {
+		return 0, fmt.Errorf("bookTicker: пустой bid")
+	}
+	b, err := strconv.ParseFloat(row.BidPrice, 64)
+	if err != nil || b <= 0 {
+		return 0, fmt.Errorf("bookTicker: bid %q", row.BidPrice)
+	}
+	return b, nil
+}
+
+// PrepareQtyBuyLive — min(ref, mark, bid) для первичного qty, затем дожим шагами пока qty×mark ≥ MIN_NOTIONAL.
+func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notionalUSDT, refSignal float64) (qtyStr string, qty float64, err error) {
+	if notionalUSDT <= 0 || refSignal <= 0 {
+		return "", 0, fmt.Errorf("некорректная цена/нотиoнал")
+	}
+	ls, err := c.lotFor(symbol)
+	if err != nil {
+		return "", 0, err
+	}
+	minN := ls.minNtl
+	if minN <= 0 {
+		minN = 5
+	}
+	floor := refSignal
+	if mp, e := c.MarkPrice(ctx, symbol); e == nil && mp > 0 {
+		floor = math.Min(floor, mp)
+	}
+	if bid, e := c.BookTickerBid(ctx, symbol); e == nil && bid > 0 {
+		floor = math.Min(floor, bid)
+	}
+	fFloor := floor * 0.998
+	if fFloor <= 0 {
+		fFloor = refSignal * 0.95
+	}
+	qtyStr, qty, err = c.PrepareQtyBuy(symbol, notionalUSDT, fFloor)
+	if err != nil {
+		return "", 0, err
+	}
+	for attempt := 0; attempt < 64; attempt++ {
+		mp, e := c.MarkPrice(ctx, symbol)
+		if e != nil || mp <= 0 {
+			mp = fFloor
+		}
+		if qty*mp >= minN-1e-10 {
+			return formatQtyString(qty, ls.step), qty, nil
+		}
+		prev := qty
+		qty = roundQtyCeil(prev+ls.step, ls.step)
+		if qty <= prev {
+			qty = prev + ls.step
+		}
+		if qty < ls.minQ {
+			qty = ls.minQ
+		}
+		if qty*mp > notionalUSDT+1e-6 {
+			return "", 0, fmt.Errorf("min notional %.2f: при mark≈%.8f не хватает нотиoнала %.2f USDT (%s)", minN, mp, notionalUSDT, symbol)
+		}
+		qtyStr = formatQtyString(qty, ls.step)
+	}
+	mp, _ := c.MarkPrice(ctx, symbol)
+	if mp <= 0 {
+		mp = fFloor
+	}
+	return "", 0, fmt.Errorf("qty×mark≈%.6f < min notional %.2f после дожима (%s)", qty*mp, minN, symbol)
+}
+
 func (c *fapiClient) postSigned(ctx context.Context, path string, params url.Values) ([]byte, error) {
 	params.Set("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
 	params.Set("recvWindow", "5000")
