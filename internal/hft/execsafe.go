@@ -69,6 +69,49 @@ func min(a, b int) int {
 	return b
 }
 
+func tickFloat(symbol string) float64 {
+	r := getRules(symbol)
+	if r == nil || r.PriceTick.IsZero() {
+		return 1e-8
+	}
+	f, _ := r.PriceTick.Float64()
+	if f <= 0 {
+		return 1e-8
+	}
+	return f
+}
+
+// Уровни относительно mark, чтобы избежать -2021 (immediate trigger).
+func adjustLongBracketStops(symbol string, mark, tp, sl float64) (float64, float64) {
+	if mark <= 0 {
+		return tp, sl
+	}
+	tick := tickFloat(symbol)
+	buf := math.Max(tick*4, mark*1e-4)
+	if sl >= mark {
+		sl = mark - buf
+	}
+	if tp <= mark {
+		tp = mark + buf
+	}
+	return tp, sl
+}
+
+func adjustShortBracketStops(symbol string, mark, tp, sl float64) (float64, float64) {
+	if mark <= 0 {
+		return tp, sl
+	}
+	tick := tickFloat(symbol)
+	buf := math.Max(tick*4, mark*1e-4)
+	if sl <= mark {
+		sl = mark + buf
+	}
+	if tp >= mark {
+		tp = mark - buf
+	}
+	return tp, sl
+}
+
 func SetupSymbol(ctx context.Context, c *futures.Client, symbol string) error {
 	return With429Retry(ctx, func() error {
 		err := c.NewChangeMarginTypeService().Symbol(symbol).MarginType(futures.MarginTypeCrossed).Do(ctx)
@@ -117,26 +160,35 @@ func marketOpen(ctx context.Context, c *futures.Client, symbol string, side futu
 		if math.Abs(amt) < 1e-12 {
 			return nil
 		}
-		if amt > 0 {
-			return placeLongBracket(ctx, c, symbol, entry)
+		mark, _ := strconv.ParseFloat(pr[0].MarkPrice, 64)
+		_ = CancelAllOpenAlgoOrders(ctx, c, symbol)
+		time.Sleep(120 * time.Millisecond)
+		qtyStr := FormatReduceQty(symbol, math.Abs(amt))
+		if qtyStr == "0" {
+			return fmt.Errorf("%s: qty для reduceOnly после округления 0", symbol)
 		}
-		return placeShortBracket(ctx, c, symbol, entry)
+		if amt > 0 {
+			return placeLongBracket(ctx, c, symbol, entry, mark, qtyStr)
+		}
+		return placeShortBracket(ctx, c, symbol, entry, mark, qtyStr)
 	})
 }
 
-func placeLongBracket(ctx context.Context, c *futures.Client, symbol string, entry float64) error {
+func placeLongBracket(ctx context.Context, c *futures.Client, symbol string, entry, mark float64, qty string) error {
 	tp := entry * (1 + TPPriceMove)
 	sl := entry * (1 - SLPriceMove)
+	tp, sl = adjustLongBracketStops(symbol, mark, tp, sl)
 	return With429Retry(ctx, func() error {
-		return PlaceAlgoTPSLLong(ctx, c, symbol, tp, sl)
+		return PlaceAlgoTPSLLong(ctx, c, symbol, tp, sl, qty)
 	})
 }
 
-func placeShortBracket(ctx context.Context, c *futures.Client, symbol string, entry float64) error {
+func placeShortBracket(ctx context.Context, c *futures.Client, symbol string, entry, mark float64, qty string) error {
 	tp := entry * (1 - TPPriceMove)
 	sl := entry * (1 + SLPriceMove)
+	tp, sl = adjustShortBracketStops(symbol, mark, tp, sl)
 	return With429Retry(ctx, func() error {
-		return PlaceAlgoTPSLShort(ctx, c, symbol, tp, sl)
+		return PlaceAlgoTPSLShort(ctx, c, symbol, tp, sl, qty)
 	})
 }
 
@@ -159,7 +211,26 @@ func ApplyTrailLongAfter15PctROE(ctx context.Context, c *futures.Client, symbol 
 		if err := c.NewCancelAllOpenOrdersService().Symbol(symbol).Do(ctx); err != nil {
 			return err
 		}
-		return PlaceAlgoTPSLLong(ctx, c, symbol, tp, stop)
+		pr, err := c.NewGetPositionRiskService().Symbol(symbol).Do(ctx)
+		if err != nil || len(pr) == 0 {
+			return err
+		}
+		amt, _ := strconv.ParseFloat(pr[0].PositionAmt, 64)
+		if math.Abs(amt) < 1e-12 {
+			return nil
+		}
+		ent, _ := strconv.ParseFloat(pr[0].EntryPrice, 64)
+		mk, _ := strconv.ParseFloat(pr[0].MarkPrice, 64)
+		qty := FormatReduceQty(symbol, math.Abs(amt))
+		if qty == "0" {
+			return nil
+		}
+		if ent > 0 {
+			stop = ent * (1 + lockMove)
+			tp = ent * (1 + TPPriceMove)
+		}
+		tp, stop = adjustLongBracketStops(symbol, mk, tp, stop)
+		return PlaceAlgoTPSLLong(ctx, c, symbol, tp, stop, qty)
 	})
 }
 
@@ -182,7 +253,26 @@ func ApplyTrailShortAfter15PctROE(ctx context.Context, c *futures.Client, symbol
 		if err := c.NewCancelAllOpenOrdersService().Symbol(symbol).Do(ctx); err != nil {
 			return err
 		}
-		return PlaceAlgoTPSLShort(ctx, c, symbol, tp, stop)
+		pr, err := c.NewGetPositionRiskService().Symbol(symbol).Do(ctx)
+		if err != nil || len(pr) == 0 {
+			return err
+		}
+		amt, _ := strconv.ParseFloat(pr[0].PositionAmt, 64)
+		if math.Abs(amt) < 1e-12 {
+			return nil
+		}
+		ent, _ := strconv.ParseFloat(pr[0].EntryPrice, 64)
+		mk, _ := strconv.ParseFloat(pr[0].MarkPrice, 64)
+		qty := FormatReduceQty(symbol, math.Abs(amt))
+		if qty == "0" {
+			return nil
+		}
+		if ent > 0 {
+			stop = ent * (1 - lockMove)
+			tp = ent * (1 - TPPriceMove)
+		}
+		tp, stop = adjustShortBracketStops(symbol, mk, tp, stop)
+		return PlaceAlgoTPSLShort(ctx, c, symbol, tp, stop, qty)
 	})
 }
 

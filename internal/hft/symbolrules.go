@@ -3,6 +3,7 @@ package hft
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -220,4 +221,35 @@ func FormatStopPrice(symbol string, price float64) string {
 	d := decimal.NewFromFloat(price)
 	p := floorToStep(d, r.PriceTick)
 	return trimQtyString(p, r.PriceTick)
+}
+
+// FormatTPPrice округляет тейк вверх к tickSize (лонг: TP выше рынка).
+func FormatTPPrice(symbol string, price float64) string {
+	r := getRules(symbol)
+	if r == nil || r.PriceTick.IsZero() {
+		return strconv.FormatFloat(price, 'f', 8, 64)
+	}
+	d := decimal.NewFromFloat(price)
+	p := ceilToStep(d, r.PriceTick)
+	return trimQtyString(p, r.PriceTick)
+}
+
+// FormatReduceQty — абсолютный размер позиции для reduceOnly (шаг qty, не больше фактического amt).
+func FormatReduceQty(symbol string, absAmt float64) string {
+	if absAmt <= 0 || math.IsNaN(absAmt) {
+		return "0"
+	}
+	r := getRules(symbol)
+	if r == nil {
+		s := strconv.FormatFloat(absAmt, 'f', 8, 64)
+		return strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	}
+	q := floorToStep(decimal.NewFromFloat(absAmt), r.QtyStep)
+	if q.IsZero() {
+		return "0"
+	}
+	if q.GreaterThan(r.MaxQty) {
+		q = r.MaxQty
+	}
+	return trimQtyString(q, r.QtyStep)
 }

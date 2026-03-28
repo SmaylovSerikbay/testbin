@@ -109,9 +109,14 @@ func main() {
 	}()
 
 	userErr := func(e error) {
-		if e != nil && ctx.Err() == nil {
-			log.Printf("user WS: %v", e)
+		if e == nil || ctx.Err() != nil {
+			return
 		}
+		// go-binance v2.8.7 не парсит ALGO_UPDATE в WsUserDataEvent — шум, не ошибка сессии.
+		if strings.Contains(e.Error(), "ALGO_UPDATE") {
+			return
+		}
+		log.Printf("user WS: %v", e)
 	}
 	_, stopUser, err := futures.WsUserDataServe(listenKey, func(ev *futures.WsUserDataEvent) {
 		if ev == nil || ev.Event != futures.UserDataEventTypeOrderTradeUpdate {

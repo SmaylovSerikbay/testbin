@@ -172,18 +172,21 @@ func parseAPIErr(b []byte) error {
 	return fmt.Errorf("HTTP %s", string(b))
 }
 
-// PlaceAlgoTPSLLong выставляет TP и SL для лонга (close all) через /fapi/v1/algoOrder.
-func PlaceAlgoTPSLLong(ctx context.Context, c *futures.Client, symbol string, tp, sl float64) error {
-	tpS := FormatStopPrice(symbol, tp)
+// PlaceAlgoTPSLLong — TP и SL для лонга через algo: reduceOnly+quantity (два closePosition на сторону дают -4130).
+func PlaceAlgoTPSLLong(ctx context.Context, c *futures.Client, symbol string, tp, sl float64, qty string) error {
+	if strings.TrimSpace(qty) == "" || qty == "0" {
+		return fmt.Errorf("algo bracket: пустой qty")
+	}
+	tpS := FormatTPPrice(symbol, tp)
 	slS := FormatStopPrice(symbol, sl)
-	// TP: SELL TAKE_PROFIT_MARKET — цена >= trigger
 	v := url.Values{}
 	v.Set("algoType", "CONDITIONAL")
 	v.Set("symbol", symbol)
 	v.Set("side", "SELL")
 	v.Set("type", "TAKE_PROFIT_MARKET")
 	v.Set("triggerPrice", tpS)
-	v.Set("closePosition", "true")
+	v.Set("quantity", qty)
+	v.Set("reduceOnly", "true")
 	v.Set("workingType", "CONTRACT_PRICE")
 	if _, err := fapiPostForm(ctx, c, "/fapi/v1/algoOrder", v); err != nil {
 		return fmt.Errorf("algo TP: %w", err)
@@ -194,7 +197,8 @@ func PlaceAlgoTPSLLong(ctx context.Context, c *futures.Client, symbol string, tp
 	v2.Set("side", "SELL")
 	v2.Set("type", "STOP_MARKET")
 	v2.Set("triggerPrice", slS)
-	v2.Set("closePosition", "true")
+	v2.Set("quantity", qty)
+	v2.Set("reduceOnly", "true")
 	v2.Set("workingType", "CONTRACT_PRICE")
 	if _, err := fapiPostForm(ctx, c, "/fapi/v1/algoOrder", v2); err != nil {
 		return fmt.Errorf("algo SL: %w", err)
@@ -202,17 +206,21 @@ func PlaceAlgoTPSLLong(ctx context.Context, c *futures.Client, symbol string, tp
 	return nil
 }
 
-// PlaceAlgoTPSLShort — TP и SL для шорта.
-func PlaceAlgoTPSLShort(ctx context.Context, c *futures.Client, symbol string, tp, sl float64) error {
+// PlaceAlgoTPSLShort — TP и SL для шорта (reduceOnly + quantity).
+func PlaceAlgoTPSLShort(ctx context.Context, c *futures.Client, symbol string, tp, sl float64, qty string) error {
+	if strings.TrimSpace(qty) == "" || qty == "0" {
+		return fmt.Errorf("algo bracket: пустой qty")
+	}
 	tpS := FormatStopPrice(symbol, tp)
-	slS := FormatStopPrice(symbol, sl)
+	slS := FormatTPPrice(symbol, sl)
 	v := url.Values{}
 	v.Set("algoType", "CONDITIONAL")
 	v.Set("symbol", symbol)
 	v.Set("side", "BUY")
 	v.Set("type", "TAKE_PROFIT_MARKET")
 	v.Set("triggerPrice", tpS)
-	v.Set("closePosition", "true")
+	v.Set("quantity", qty)
+	v.Set("reduceOnly", "true")
 	v.Set("workingType", "CONTRACT_PRICE")
 	if _, err := fapiPostForm(ctx, c, "/fapi/v1/algoOrder", v); err != nil {
 		return fmt.Errorf("algo TP: %w", err)
@@ -223,7 +231,8 @@ func PlaceAlgoTPSLShort(ctx context.Context, c *futures.Client, symbol string, t
 	v2.Set("side", "BUY")
 	v2.Set("type", "STOP_MARKET")
 	v2.Set("triggerPrice", slS)
-	v2.Set("closePosition", "true")
+	v2.Set("quantity", qty)
+	v2.Set("reduceOnly", "true")
 	v2.Set("workingType", "CONTRACT_PRICE")
 	if _, err := fapiPostForm(ctx, c, "/fapi/v1/algoOrder", v2); err != nil {
 		return fmt.Errorf("algo SL: %w", err)
