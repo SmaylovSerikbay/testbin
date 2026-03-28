@@ -352,7 +352,9 @@ func notionalBudgetRef(mark, index float64) float64 {
 
 const minNotionalOrderSlack = 1.022 // запас к лимиту биржи и рассинхрону mark/index между REST-вызовами
 
-// PrepareQtyBuyLive — min(ref, mark, bid) для первичного qty, затем дожим шагами пока qty×min(mark,index) ≥ MIN_NOTIONAL×slack.
+// PrepareQtyBuyLive — qty из notional / max(сигнал, max(mark,index)) с небольшим запасом, затем дожим шагами
+// пока qty×min(mark,index) ≥ MIN_NOTIONAL×slack и qty×max(mark,index) ≤ notional.
+// Раньше первичный qty считали по min(ref,bid,min(m,i)) — получалось завышение qty и срыв по бюджету.
 func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notionalUSDT, refSignal float64) (qtyStr string, qty float64, err error) {
 	if notionalUSDT <= 0 || refSignal <= 0 {
 		return "", 0, fmt.Errorf("некорректная цена/нотиoнал")
@@ -366,31 +368,41 @@ func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notio
 		minN = 5
 	}
 	minNeed := minN * minNotionalOrderSlack
-	floor := refSignal
-	if mp, idx, e := c.PremiumMarkIndex(ctx, symbol); e == nil && mp > 0 {
-		floor = math.Min(floor, notionalCheckRef(mp, idx))
+
+	mp, idx, e := c.PremiumMarkIndex(ctx, symbol)
+	if e != nil || mp <= 0 {
+		mp, idx = refSignal, refSignal
 	}
-	if bid, e := c.BookTickerBid(ctx, symbol); e == nil && bid > 0 {
-		floor = math.Min(floor, bid)
+	budgetRef0 := notionalBudgetRef(mp, idx)
+	refForQty := budgetRef0
+	if refSignal > refForQty {
+		refForQty = refSignal
 	}
-	fFloor := floor * 0.998
-	if fFloor <= 0 {
-		fFloor = refSignal * 0.95
+	const priceSizingSlack = 1.003 // проскальзывание / тик к mark
+	refForQty *= priceSizingSlack
+	if refForQty <= 0 {
+		refForQty = refSignal
 	}
-	qtyStr, qty, err = c.PrepareQtyBuy(symbol, notionalUSDT, fFloor)
+
+	qtyStr, qty, err = c.PrepareQtyBuy(symbol, notionalUSDT, refForQty)
 	if err != nil {
 		return "", 0, err
 	}
 	for attempt := 0; attempt < 64; attempt++ {
-		mp, idx, e := c.PremiumMarkIndex(ctx, symbol)
-		if e != nil || mp <= 0 {
-			mp = fFloor
-			idx = mp
+		mp2, idx2, e2 := c.PremiumMarkIndex(ctx, symbol)
+		if e2 != nil || mp2 <= 0 {
+			mp2, idx2 = mp, idx
 		}
-		ntlRef := notionalCheckRef(mp, idx)
-		budgetRef := notionalBudgetRef(mp, idx)
+		ntlRef := notionalCheckRef(mp2, idx2)
+		budgetRef := notionalBudgetRef(mp2, idx2)
 		if qty*budgetRef > notionalUSDT+1e-6 {
-			return "", 0, fmt.Errorf("min notional %.2f: при max(mark,index)≈%.8f нотиoнал %.2f USDT не покрывает нужный qty (%s)", minN, budgetRef, notionalUSDT, symbol)
+			qtyMinN := roundQtyCeil(minNeed/ntlRef, ls.step)
+			if qtyMinN < ls.minQ {
+				qtyMinN = ls.minQ
+			}
+			needNtl := qtyMinN * budgetRef
+			return "", 0, fmt.Errorf("min notional %.2f: при min(mark,index)≈%.8f max≈%.8f нужно ≥%.2f USDT нотиoнала под шаг лота, задано %.2f (%s)",
+				minN, ntlRef, budgetRef, needNtl, notionalUSDT, symbol)
 		}
 		if qty*ntlRef >= minNeed-1e-10 {
 			out := formatQtyString(qty, ls.step)
@@ -417,12 +429,11 @@ func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notio
 		}
 		qtyStr = formatQtyString(qty, ls.step)
 	}
-	mp, idx, _ := c.PremiumMarkIndex(ctx, symbol)
-	if mp <= 0 {
-		mp = fFloor
-		idx = mp
+	mp3, idx3, _ := c.PremiumMarkIndex(ctx, symbol)
+	if mp3 <= 0 {
+		mp3, idx3 = mp, idx
 	}
-	ntlRef := notionalCheckRef(mp, idx)
+	ntlRef := notionalCheckRef(mp3, idx3)
 	return "", 0, fmt.Errorf("qty×min(mark,index)≈%.6f < min notional %.2f×slack после дожима (%s)", qty*ntlRef, minN, symbol)
 }
 

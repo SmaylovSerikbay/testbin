@@ -1284,6 +1284,9 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		h.restMu.Unlock()
 		st.mu.Lock()
 		st.opening = false
+		if h.htfFailCooldown > 0 {
+			st.htfCooldownUntil = time.Now().Add(h.htfFailCooldown)
+		}
 		st.mu.Unlock()
 		log.Printf("[%s] подготовка qty: %v", sym, err)
 		return
