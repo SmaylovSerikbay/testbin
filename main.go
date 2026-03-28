@@ -501,6 +501,7 @@ type hub struct {
 
 	slConfirmTicks int     // SL только после N подряд тиков ≤ линии стопа (1 = как раньше)
 	cutMarginPct   float64 // 0 = выкл; немедленный выход при ROI на маржу ≤ −X% (модель), без ожидания N тиков SL
+	maxLossUSDT    float64 // 0 = выкл; net в модели ≤ −X USDT — CAP (раньше глубокого SL/fill на альтах)
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -588,6 +589,11 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 		h.pushFlashSample(st, now, price)
 		if h.checkFlashDump(st, price, now) {
 			h.triggerClose(st, sym, "FLASH", price, now)
+			return
+		}
+		if h.maxLossUSDT > 0 && netEst <= -h.maxLossUSDT {
+			st.slBelowCnt = 0
+			h.triggerClose(st, sym, "CAP", price, now)
 			return
 		}
 
@@ -1357,6 +1363,10 @@ func main() {
 	if cutMg < 0 {
 		cutMg = 0
 	}
+	maxLossU := envGetFloat(em, "PUMP_MAX_LOSS_USDT", 0)
+	if maxLossU < 0 {
+		maxLossU = 0
+	}
 
 	tpMove := priceMoveForMarginPct(tpm, lev)
 	slMove := priceMoveForMarginPct(slm, lev)
@@ -1651,6 +1661,7 @@ func main() {
 		maxConsecLosses:        maxConsecLoss,
 		slConfirmTicks:         slConfirm,
 		cutMarginPct:           cutMg,
+		maxLossUSDT:            maxLossU,
 	}
 
 	if liveTrading {
@@ -1814,8 +1825,12 @@ func main() {
 	if cutMg > 0 {
 		cutStr = fmt.Sprintf("ROI≤−%.1f%% на маржу (модель), один тик", cutMg)
 	}
-	log.Printf("Выход по позиции: CUT=%s | BANK=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%; по TIME если цена≤SL — всё равно SL",
-		cutStr, bankStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100)
+	capStr := "выкл"
+	if maxLossU > 0 {
+		capStr = fmt.Sprintf("net≤−%.4f USDT (модель), CAP", maxLossU)
+	}
+	log.Printf("Выход по позиции: CAP=%s | CUT=%s | BANK=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%; TIME+цена≤SL→SL",
+		capStr, cutStr, bankStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
