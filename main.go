@@ -457,6 +457,7 @@ type hub struct {
 	aggMinLastOverFirstPct float64 // 0 = выкл; last ≥ first×(1+pct/100)
 	aggMinQualTrades       int     // 0 = выкл
 	aggMinSingleTradeUSDT  float64 // 0 = выкл; max одной квалиф. сделки в USDT ≥ порога («крупный тик»)
+	aggMinHighLowRangePct  float64 // 0 = выкл; (max−min)/min в окне в % — отсекаем узкий 2–3% дребезг
 
 	maxHold time.Duration
 
@@ -836,6 +837,10 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 	}
 	movePct := (lastQual - minP) / minP * 100
 	if sumQ < h.aggMinQuote || movePct < h.aggMinMovePct || lastQual <= minP {
+		return
+	}
+	hlRangePct := (maxP - minP) / minP * 100
+	if h.aggMinHighLowRangePct > 0 && hlRangePct < h.aggMinHighLowRangePct {
 		return
 	}
 	if h.aggNearPeakFrac > 0 && lastQual < maxP*(1-h.aggNearPeakFrac) {
@@ -1432,6 +1437,16 @@ func main() {
 			aggMinSingle *= msm
 		}
 	}
+	aggMinHlRg := envGetFloat(em, "AGG_MIN_HIGH_LOW_RANGE_PCT", 0)
+	if aggMinHlRg < 0 {
+		aggMinHlRg = 0
+	}
+	if liveTrading {
+		aggMinHlRg += envGetFloat(em, "LIVE_AGG_HIGH_LOW_ADD_PCT", 0)
+	}
+	if aggMinHlRg < 0 {
+		aggMinHlRg = 0
+	}
 	aggTaker := strings.TrimSpace(envGet(em, "AGG_TAKER_BUY_ONLY", "1")) != "0"
 
 	miniEntS := strings.TrimSpace(envGet(em, "PUMP_MINI_ENTRY", ""))
@@ -1590,6 +1605,7 @@ func main() {
 		aggMinLastOverFirstPct: aggMinLof,
 		aggMinQualTrades:       aggMinQualTr,
 		aggMinSingleTradeUSDT:  aggMinSingle,
+		aggMinHighLowRangePct:  aggMinHlRg,
 		maxHold:                maxHold,
 		live:                   false,
 		liveHedge:              liveHedge,
@@ -1710,12 +1726,16 @@ func main() {
 		if aggMinSingle > 0 {
 			singleNote = fmt.Sprintf(", max-тик ≥%.0f USDT", aggMinSingle)
 		}
+		hlNote := ""
+		if aggMinHlRg > 0 {
+			hlNote = fmt.Sprintf(", размах (max−min)/min ≥%.3f%%", aggMinHlRg)
+		}
 		liveBoost := ""
 		if liveTrading {
 			liveBoost = " [лайв: усиленные пороги]"
 		}
-		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s%s%s%s, тейкер %s%s",
-			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, lofNote, qNote, singleNote, taker, liveBoost)
+		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s%s%s%s%s, тейкер %s%s",
+			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, hlNote, lofNote, qNote, singleNote, taker, liveBoost)
 	}
 	miniRule := "да"
 	if !miniEntry {
