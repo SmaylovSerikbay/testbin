@@ -431,12 +431,16 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 	if h.pumpFloorPct > priceTh {
 		priceTh = h.pumpFloorPct
 	}
-	if x := h.retMult * medAbs; x > priceTh {
-		priceTh = x
+	if h.retMult > 0 {
+		if x := h.retMult * medAbs; x > priceTh {
+			priceTh = x
+		}
 	}
 	volTh := h.minQuoteDlt
-	if x := h.volMult * medDq; x > volTh {
-		volTh = x
+	if h.volMult > 0 && medDq > 0 {
+		if x := h.volMult * medDq; x > volTh {
+			volTh = x
+		}
 	}
 
 	real := deltaPct > 0 && deltaPct <= h.maxPumpPct &&
@@ -598,13 +602,19 @@ func main() {
 		pumpPct = defaultPumpMinPct
 	}
 	pumpFloor := envGetFloat(em, "PUMP_FLOOR_PCT", defaultPumpFloorPct)
+	// 0 = не умножать на med|1s| (иначе на BTC/ETH порог цены уезжает вверх)
 	retMult := envGetFloat(em, "PUMP_RET_MULT", defaultRetMult)
-	if retMult < 2 {
+	if retMult < 0 {
+		retMult = defaultRetMult
+	} else if retMult > 0 && retMult < 2 {
 		retMult = 2
 	}
 	minQD := envGetFloat(em, "PUMP_MIN_QUOTE_DELTA", defaultMinQuoteDelta)
+	// 0 = только абсолютный пол PUMP_MIN_QUOTE_DELTA (иначе volTh = N×medΔq недостижим на ликвидных парах)
 	volMult := envGetFloat(em, "PUMP_VOL_MULT", defaultVolMult)
-	if volMult < 1.5 {
+	if volMult < 0 {
+		volMult = defaultVolMult
+	} else if volMult > 0 && volMult < 1.5 {
 		volMult = 1.5
 	}
 	histLen := envGetInt(em, "PUMP_HIST_LEN", defaultHistLen)
@@ -688,8 +698,16 @@ func main() {
 		go runConnection(ctx, u, h, readDeadline, &wg)
 	}
 
-	log.Printf("WS: %s — conn=%d streams/sock≤%d | «реальный» памп: цена ≥ max(%.2f%%, floor %.2f%%, %.1f×med|1s|), Δq ≥ max(%.0fk, %.1f×medΔq), окно=%d разгон=%d тик max=%.1f%% подряд=%d cooldown=%s | симуляция $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
-		baseWS, len(batches), streamsConn, pumpPct, pumpFloor, retMult, minQD/1000, volMult, histLen, warmup, maxPump, pticks, cd, m, lev, tpm, slm, tpMove*100, slMove*100)
+	priceRule := fmt.Sprintf("max(%.2f%%, floor %.2f%%, %.1f×med|1s|)", pumpPct, pumpFloor, retMult)
+	if retMult <= 0 {
+		priceRule = fmt.Sprintf("max(%.2f%%, floor %.2f%%) без med|1s|", pumpPct, pumpFloor)
+	}
+	volRule := fmt.Sprintf("max(%.0fk, %.1f×medΔq)", minQD/1000, volMult)
+	if volMult <= 0 {
+		volRule = fmt.Sprintf("≥%.0fk USDT за ~1с (без medΔq)", minQD/1000)
+	}
+	log.Printf("WS: %s — conn=%d streams/sock≤%d | памп: цена ≥ %s; Δq %s; окно=%d разгон=%d тик max=%.1f%% подряд=%d cooldown=%s | симуляция $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
+		baseWS, len(batches), streamsConn, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, m, lev, tpm, slm, tpMove*100, slMove*100)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
