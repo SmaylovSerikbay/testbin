@@ -871,8 +871,13 @@ func (h *hub) closeTrade(st *symState, sym, reason string, exitPrice float64, pn
 	if h.live {
 		mode = "лайв"
 	}
+	displayReason := reason
+	// Лонг+SL по мини-тикеру, MARKET fill мог оказаться выше входа (лага/волатильность) — не путать с ошибкой логики.
+	if reason == "SL" && pnl > 1e-8 && st.entry > 0 && exitPrice > st.entry {
+		displayReason = "SL (тик≤стоп, fill выше входа)"
+	}
 	log.Printf("[%s] %s entry=%.8f exit=%.8f pnl=%.6f USDT (%.2f%% на $1) hold=%s [%s]",
-		sym, reason, st.entry, exitPrice, pnl, roi, hold.Truncate(time.Second), mode)
+		sym, displayReason, st.entry, exitPrice, pnl, roi, hold.Truncate(time.Second), mode)
 	st.inPos = false
 	st.entry = 0
 	st.qty = 0
