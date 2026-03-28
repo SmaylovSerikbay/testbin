@@ -25,12 +25,12 @@ import (
 )
 
 const (
-	marginUSDT     = 1.0
-	leverage       = 20.0
-	tpMarginPct    = 60.0 // тейк-профит в % от маржи
-	slMarginPct    = 15.0 // стоп в % от маржи
-	feeRoundTrip   = 0.0008 // ~0.04% вход + выход на нотиoнал (оценка)
-	minSymbols        = 400
+	marginUSDT         = 1.0
+	leverage           = 20.0
+	tpMarginPct        = 60.0   // тейк-профит в % от маржи
+	slMarginPct        = 15.0   // стоп в % от маржи
+	feeRoundTrip       = 0.0008 // ~0.04% вход + выход на нотиoнал (оценка)
+	minSymbols         = 400
 	defaultStreamsConn = 120
 	defaultWSDeadlineS = 60
 	defaultStatsSec    = 10
@@ -173,9 +173,9 @@ type exchangeInfo struct {
 }
 
 type ticker24 struct {
-	Symbol       string `json:"symbol"`
-	QuoteVolume  string `json:"quoteVolume"`
-	LastPrice    string `json:"lastPrice"`
+	Symbol      string `json:"symbol"`
+	QuoteVolume string `json:"quoteVolume"`
+	LastPrice   string `json:"lastPrice"`
 }
 
 func httpGetJSON(ctx context.Context, client *http.Client, url string, out any) error {
@@ -262,9 +262,9 @@ type symState struct {
 	openedAt     time.Time
 	pumpArmCnt   int
 	lastSignalAt time.Time
-	opening      bool // в процессе выставления лайв-ордера
-	closing      bool // в процессе закрытия лайв-ордера
-	posLev       int  // фактическое плечо лайв-позиции (0 = симуляция / не задано)
+	opening      bool    // в процессе выставления лайв-ордера
+	closing      bool    // в процессе закрытия лайв-ордера
+	posLev       int     // фактическое плечо лайв-позиции (0 = симуляция / не задано)
 	peakPx       float64 // максимум цены в позиции (для трейлинга)
 	trailArmed   bool    // был ли откат от пика после «настоящего» движения (с учётом комиссии)
 
@@ -420,8 +420,8 @@ func streamsKindURL(baseWS string, syms []string, kind string) string {
 
 type hub struct {
 	states       sync.Map // symbol -> *symState
-	pumpPct      float64 // минимальный % движения (планка с env)
-	pumpFloorPct float64 // доп. нижняя планка против шума
+	pumpPct      float64  // минимальный % движения (планка с env)
+	pumpFloorPct float64  // доп. нижняя планка против шума
 	pumpTicks    int
 	retMult      float64
 	minQuoteDlt  float64
@@ -431,9 +431,9 @@ type hub struct {
 	cooldown     time.Duration
 	histLen      int
 
-	tpMarginPct float64 // из .env — для TP/SL по цене с учётом плеча
-	slMarginPct float64
-	feeRT       float64
+	tpMarginPct  float64 // из .env — для TP/SL по цене с учётом плеча
+	slMarginPct  float64
+	feeRT        float64
 	marginUSDT   float64
 	notionalUSDT float64
 	totalPnL     atomic.Uint64 // bits of float64
@@ -446,12 +446,15 @@ type hub struct {
 
 	miniEntry bool // открывать ли позицию по мини-тикеру (если false — только agg)
 
-	aggEnabled    bool
-	aggWindowMs   int64
-	aggMinQuote   float64
-	aggMinMovePct float64
+	aggEnabled      bool
+	aggWindowMs     int64
+	aggMinQuote     float64
+	aggMinMovePct   float64
 	aggNearPeakFrac float64 // 0 = выкл; последняя цена ≥ max окна × (1−frac)
-	aggTakerBuy   bool      // только агрессивные покупки (!buyerMaker)
+	aggTakerBuy     bool    // только агрессивные покупки (!buyerMaker)
+	// Анти-фейк: рост от первой квалиф. сделки в окне (не только от min к last) + мин. число тейкер-баёв
+	aggMinLastOverFirstPct float64 // 0 = выкл; last ≥ first×(1+pct/100)
+	aggMinQualTrades       int     // 0 = выкл
 
 	maxHold time.Duration
 
@@ -754,16 +757,19 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		st.aggBuf = st.aggBuf[i:]
 	}
 
-	var minP, maxP, lastQual, sumQ float64
+	var minP, maxP, lastQual, firstQual, sumQ float64
 	var have bool
+	qualN := 0
 	for j := range st.aggBuf {
 		pt := &st.aggBuf[j]
 		if h.aggTakerBuy && pt.buyerMaker {
 			continue
 		}
+		qualN++
 		sumQ += pt.quoteUSDT
 		if !have {
 			minP, maxP = pt.price, pt.price
+			firstQual = pt.price
 		} else {
 			if pt.price < minP {
 				minP = pt.price
@@ -784,6 +790,15 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 	}
 	if h.aggNearPeakFrac > 0 && lastQual < maxP*(1-h.aggNearPeakFrac) {
 		return
+	}
+	if h.aggMinQualTrades > 0 && qualN < h.aggMinQualTrades {
+		return
+	}
+	if h.aggMinLastOverFirstPct > 0 && firstQual > 0 {
+		lof := (lastQual - firstQual) / firstQual * 100
+		if lof < h.aggMinLastOverFirstPct {
+			return
+		}
 	}
 	st.lastSignalAt = now
 	if h.live {
@@ -1300,11 +1315,26 @@ func main() {
 	} else if liveTrading {
 		aggNearPeakFrac = 0.001
 	}
+	aggMinLof := envGetFloat(em, "AGG_MIN_LAST_OVER_FIRST_PCT", 0)
+	if aggMinLof < 0 {
+		aggMinLof = 0
+	}
+	aggMinQualTr := envGetInt(em, "AGG_MIN_QUAL_TRADES", 0)
+	if aggMinQualTr < 0 {
+		aggMinQualTr = 0
+	}
 	if liveTrading {
 		if mq := envGetFloat(em, "LIVE_AGG_QUOTE_MULT", 1.32); mq > 1 {
 			aggMinQ *= mq
 		}
 		aggMinMv += envGetFloat(em, "LIVE_AGG_MOVE_ADD_PCT", 0.04)
+		aggMinLof += envGetFloat(em, "LIVE_AGG_LAST_OVER_FIRST_ADD_PCT", 0)
+		if add := envGetInt(em, "LIVE_AGG_MIN_QUAL_TRADES_ADD", 0); add > 0 {
+			aggMinQualTr += add
+		}
+	}
+	if aggMinLof < 0 {
+		aggMinLof = 0
 	}
 	aggTaker := strings.TrimSpace(envGet(em, "AGG_TAKER_BUY_ONLY", "1")) != "0"
 
@@ -1417,48 +1447,50 @@ func main() {
 	}
 
 	h := &hub{
-		pumpPct:       pumpPct,
-		pumpFloorPct:  pumpFloor,
-		pumpTicks:     pticks,
-		retMult:       retMult,
-		minQuoteDlt:   minQD,
-		volMult:       volMult,
-		warmupBars:    warmup,
-		maxPumpPct:    maxPump,
-		cooldown:      cd,
-		histLen:       histLen,
-		tpMarginPct:   tpm,
-		slMarginPct:   slm,
-		feeRT:         fee,
-		marginUSDT:    m,
-		notionalUSDT:  m * lev,
-		dbg:           dbg,
-		miniEntry:     miniEntry,
-		aggEnabled:    aggEnabled,
-		aggWindowMs:   aggWinMs,
-		aggMinQuote:     aggMinQ,
-		aggMinMovePct:   aggMinMv,
-		aggNearPeakFrac: aggNearPeakFrac,
-		aggTakerBuy:     aggTaker,
-		maxHold:       maxHold,
-		live:          false,
-		liveHedge:     liveHedge,
-		liveMaxPos:       liveMaxPos,
-		levInt:           levInt,
-		liveMarginFrac:   liveMarginFrac,
-		scratchDur:        scratchDur,
-		scratchMinDur:     scratchMinDur,
-		scratchPull:       scratchPull,
-		trailBack:         trailBack,
-		trailFeeExtra:     trailFeeExtra,
-		trailMinNetUSDT:   trailMinNet,
-		flashWindow:        flashWindow,
-		flashDropFrac:      flashDrop,
-		flashSlopeFrac:     flashSlope,
-		flashMinSpan:       flashMinSpan,
-		maxSessionLossUSDT: maxSessLoss,
-		minAvailToTrade:    minAvailTrade,
-		maxConsecLosses:    maxConsecLoss,
+		pumpPct:                pumpPct,
+		pumpFloorPct:           pumpFloor,
+		pumpTicks:              pticks,
+		retMult:                retMult,
+		minQuoteDlt:            minQD,
+		volMult:                volMult,
+		warmupBars:             warmup,
+		maxPumpPct:             maxPump,
+		cooldown:               cd,
+		histLen:                histLen,
+		tpMarginPct:            tpm,
+		slMarginPct:            slm,
+		feeRT:                  fee,
+		marginUSDT:             m,
+		notionalUSDT:           m * lev,
+		dbg:                    dbg,
+		miniEntry:              miniEntry,
+		aggEnabled:             aggEnabled,
+		aggWindowMs:            aggWinMs,
+		aggMinQuote:            aggMinQ,
+		aggMinMovePct:          aggMinMv,
+		aggNearPeakFrac:        aggNearPeakFrac,
+		aggTakerBuy:            aggTaker,
+		aggMinLastOverFirstPct: aggMinLof,
+		aggMinQualTrades:       aggMinQualTr,
+		maxHold:                maxHold,
+		live:                   false,
+		liveHedge:              liveHedge,
+		liveMaxPos:             liveMaxPos,
+		levInt:                 levInt,
+		liveMarginFrac:         liveMarginFrac,
+		scratchDur:             scratchDur,
+		scratchMinDur:          scratchMinDur,
+		scratchPull:            scratchPull,
+		trailBack:              trailBack,
+		trailFeeExtra:          trailFeeExtra,
+		trailMinNetUSDT:        trailMinNet,
+		flashWindow:            flashWindow,
+		flashDropFrac:          flashDrop,
+		flashSlopeFrac:         flashSlope,
+		flashMinSpan:           flashMinSpan,
+		maxSessionLossUSDT:     maxSessLoss,
+		minAvailToTrade:        minAvailTrade,
+		maxConsecLosses:        maxConsecLoss,
 	}
 
 	if liveTrading {
@@ -1542,12 +1574,20 @@ func main() {
 		if aggNearPeakFrac > 0 {
 			peakNote = fmt.Sprintf(", last у хая окна (≤%.3f%% от max)", aggNearPeakFrac*100)
 		}
+		lofNote := ""
+		if aggMinLof > 0 {
+			lofNote = fmt.Sprintf(", first→last ≥%.3f%%", aggMinLof)
+		}
+		qNote := ""
+		if aggMinQualTr > 0 {
+			qNote = fmt.Sprintf(", ≥%d тейкер-buy", aggMinQualTr)
+		}
 		liveBoost := ""
 		if liveTrading {
 			liveBoost = " [лайв: усиленные пороги]"
 		}
-		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s, тейкер %s%s",
-			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, taker, liveBoost)
+		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s%s%s, тейкер %s%s",
+			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, lofNote, qNote, taker, liveBoost)
 	}
 	miniRule := "да"
 	if !miniEntry {
