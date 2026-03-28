@@ -561,8 +561,9 @@ type hub struct {
 
 	// За интервал STATS: сколько раз agg прошёл все фильтры и запущен лайв-вход (до HTF/ордера).
 	aggPassLive atomic.Uint64
-	// Диагностика: первый непройденный фильтр после quote+move (Swap в STATS).
-	aggRejBase   atomic.Uint64 // sumQ или min→last move
+	// Диагностика отсева agg (Swap в STATS).
+	aggRejQuote  atomic.Uint64 // сумма USDT в окне < порога
+	aggRejMove   atomic.Uint64 // min→last % или last на минимуме окна
 	aggRejHL     atomic.Uint64
 	aggRejPeak   atomic.Uint64
 	aggRejQual   atomic.Uint64
@@ -1013,8 +1014,12 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		return
 	}
 	movePct := (lastQual - minP) / minP * 100
-	if sumQ < h.aggMinQuote || movePct < h.aggMinMovePct || lastQual <= minP {
-		h.aggRejBase.Add(1)
+	if sumQ < h.aggMinQuote {
+		h.aggRejQuote.Add(1)
+		return
+	}
+	if movePct < h.aggMinMovePct || lastQual <= minP {
+		h.aggRejMove.Add(1)
 		return
 	}
 	hlRangePct := (maxP - minP) / minP * 100
@@ -2171,15 +2176,16 @@ func main() {
 						blk = " | ВХОДЫ ЗАБЛОКИРОВАНЫ (страховка)"
 					}
 					ap := h.aggPassLive.Swap(0)
-					rb := h.aggRejBase.Swap(0)
+					rq := h.aggRejQuote.Swap(0)
+					rm := h.aggRejMove.Swap(0)
 					rhl := h.aggRejHL.Swap(0)
 					rpk := h.aggRejPeak.Swap(0)
-					rq := h.aggRejQual.Swap(0)
+					rqual := h.aggRejQual.Swap(0)
 					rlf := h.aggRejLOF.Swap(0)
 					rs := h.aggRejSingle.Swap(0)
 					rvw := h.aggRejVwap.Swap(0)
-					aggBlk := fmt.Sprintf(" | agg→лайв: %d | отсев base=%d HL=%d peak=%d qual=%d 1st→last=%d single=%d vwap=%d",
-						ap, rb, rhl, rpk, rq, rlf, rs, rvw)
+					aggBlk := fmt.Sprintf(" | agg→лайв: %d | отсев quote=%d move=%d HL=%d peak=%d qual=%d 1st→last=%d single=%d vwap=%d",
+						ap, rq, rm, rhl, rpk, rqual, rlf, rs, rvw)
 					if err != nil {
 						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s%s | баланс: %v",
 							h.closedTrades.Load(), pnl, blk, aggBlk, err)
