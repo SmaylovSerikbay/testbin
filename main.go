@@ -688,6 +688,13 @@ func (st *symState) medianDQ(scratch []float64, histLen int) float64 {
 	return medianSorted(scratch)
 }
 
+// htfSymCooldownActive — символ в паузе после отказа HTF.
+// Пока until == time.Time{} (ноль), паузы нет: иначе !now.Before(until) при нулевом until
+// всегда истинно (текущее время не раньше года 1), и лайв/сим входы блокируются навсегда.
+func htfSymCooldownActive(now, until time.Time, failCD time.Duration) bool {
+	return failCD > 0 && !until.IsZero() && !now.Before(until)
+}
+
 func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now time.Time) {
 	v, _ := h.states.LoadOrStore(sym, newSymState(h.notionalUSDT, h.histLen))
 	st := v.(*symState)
@@ -923,7 +930,7 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			if h.entriesPaused.Load() || st.opening || st.inPos {
 				return
 			}
-			if h.htfFilter > 0 && h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+			if h.htfFilter > 0 && htfSymCooldownActive(now, st.htfCooldownUntil, h.htfFailCooldown) {
 				return
 			}
 			st.opening = true
@@ -934,7 +941,7 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			return
 		}
 		if h.htfFilter > 0 {
-			if h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+			if htfSymCooldownActive(now, st.htfCooldownUntil, h.htfFailCooldown) {
 				return
 			}
 			st.opening = true
@@ -1063,7 +1070,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		if h.entriesPaused.Load() || st.opening || st.inPos {
 			return
 		}
-		if h.htfFilter > 0 && h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+		if h.htfFilter > 0 && htfSymCooldownActive(now, st.htfCooldownUntil, h.htfFailCooldown) {
 			h.aggRejHtfWait.Add(1)
 			return
 		}
@@ -1076,7 +1083,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		return
 	}
 	if h.htfFilter > 0 {
-		if h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+		if htfSymCooldownActive(now, st.htfCooldownUntil, h.htfFailCooldown) {
 			return
 		}
 		st.opening = true
