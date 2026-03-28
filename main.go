@@ -559,6 +559,9 @@ type hub struct {
 	dbgWithQ atomic.Uint64 // из них с валидным q
 	dbgAgg   atomic.Uint64
 
+	// За интервал STATS: сколько раз agg прошёл все фильтры и запущен лайв-вход (до HTF/ордера).
+	aggPassLive atomic.Uint64
+
 	miniEntry bool // открывать ли позицию по мини-тикеру (если false — только agg)
 
 	aggEnabled      bool
@@ -1041,6 +1044,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		if h.htfFilter > 0 && h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
 			return
 		}
+		h.aggPassLive.Add(1)
 		st.opening = true
 		go h.doOpenAsync(sym, st, lastQual, now)
 		return
@@ -2150,12 +2154,14 @@ func main() {
 					if h.entriesPaused.Load() {
 						blk = " | ВХОДЫ ЗАБЛОКИРОВАНЫ (страховка)"
 					}
+					ap := h.aggPassLive.Swap(0)
+					aggBlk := fmt.Sprintf(" | agg→лайв за интервал: %d", ap)
 					if err != nil {
-						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s | баланс: %v",
-							h.closedTrades.Load(), pnl, blk, err)
+						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s%s | баланс: %v",
+							h.closedTrades.Load(), pnl, blk, aggBlk, err)
 					} else {
-						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s | USDT-M кошелёк=%.4f доступно=%.4f",
-							h.closedTrades.Load(), pnl, blk, w, av)
+						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s%s | USDT-M кошелёк=%.4f доступно=%.4f",
+							h.closedTrades.Load(), pnl, blk, aggBlk, w, av)
 					}
 				} else {
 					log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT (симуляция)",
