@@ -226,6 +226,7 @@ func main() {
 			fmt.Println("────────────────────────────────────────")
 			fmt.Println("Тест ордера: в .env DEMO_SMOKE_ORDER=1 (+ SMOKE_SYMBOL=BTCUSDT) — через 5с MARKET LONG")
 			fmt.Println("Волатильные пары: UNIVERSE_SORT=change UNIVERSE_SIZE=20 | чаще сигналы: HFT_AGGRESSIVE=1")
+			fmt.Println("Лимит позиций (меньше -2027): HFT_MAX_POSITIONS=5 в .env")
 			fmt.Println("Введите PANIC + Enter — закрыть всё; Ctrl+C — выход")
 		}
 	}

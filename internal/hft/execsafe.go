@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -133,10 +134,55 @@ func MarketOpenShort(ctx context.Context, c *futures.Client, symbol, qty string)
 	return marketOpen(ctx, c, symbol, futures.SideTypeSell, qty)
 }
 
+// maxOpenSymbolsEnv — лимит одновременных символов с ненулевой позицией (0 = выкл.). См. .env HFT_MAX_POSITIONS.
+func maxOpenSymbolsEnv() int {
+	v := strings.TrimSpace(os.Getenv("HFT_MAX_POSITIONS"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func countNonFlatSymbols(ctx context.Context, c *futures.Client) (int, error) {
+	all, err := c.NewGetPositionRiskService().Do(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, p := range all {
+		amt, _ := strconv.ParseFloat(p.PositionAmt, 64)
+		if math.Abs(amt) >= 1e-12 {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func marketOpen(ctx context.Context, c *futures.Client, symbol string, side futures.SideType, qty string) error {
 	orderGate.Lock()
 	defer orderGate.Unlock()
 	return With429Retry(ctx, func() error {
+		if mx := maxOpenSymbolsEnv(); mx > 0 {
+			pr0, err := c.NewGetPositionRiskService().Symbol(symbol).Do(ctx)
+			flat := true
+			if err == nil && len(pr0) > 0 {
+				a, _ := strconv.ParseFloat(pr0[0].PositionAmt, 64)
+				flat = math.Abs(a) < 1e-12
+			}
+			if flat {
+				n, err := countNonFlatSymbols(ctx, c)
+				if err != nil {
+					return err
+				}
+				if n >= mx {
+					return fmt.Errorf("лимит HFT_MAX_POSITIONS=%d (открыто символов: %d), отказ до MARKET — см. -2027", mx, n)
+				}
+			}
+		}
 		qtyAdj, err := AdjustMarketQty(ctx, c, symbol, qty)
 		if err != nil {
 			return err
