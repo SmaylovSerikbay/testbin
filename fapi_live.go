@@ -202,6 +202,45 @@ func (c *fapiClient) lotFor(symbol string) (lotSpec, error) {
 	return ls, nil
 }
 
+// MarkPrice — публичный mark price (без ключа). Нужен, чтобы не занижать qty при сигнале на локальном хае last/ref.
+func (c *fapiClient) MarkPrice(ctx context.Context, symbol string) (float64, error) {
+	u := c.base + "/fapi/v1/premiumIndex?symbol=" + url.QueryEscape(symbol)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		sn := len(raw)
+		if sn > 220 {
+			sn = 220
+		}
+		return 0, fmt.Errorf("premiumIndex HTTP %d: %s", resp.StatusCode, string(raw[:sn]))
+	}
+	var row struct {
+		MarkPrice string `json:"markPrice"`
+	}
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return 0, err
+	}
+	if row.MarkPrice == "" {
+		return 0, fmt.Errorf("premiumIndex: пустой markPrice")
+	}
+	mp, err := strconv.ParseFloat(row.MarkPrice, 64)
+	if err != nil || mp <= 0 {
+		return 0, fmt.Errorf("premiumIndex: markPrice %q", row.MarkPrice)
+	}
+	return mp, nil
+}
+
 func roundQtyDown(q, step float64) float64 {
 	if step <= 0 {
 		return q
@@ -437,9 +476,9 @@ func (c *fapiClient) maxLeverageForNotional(ctx context.Context, symbol string, 
 	var rows []struct {
 		Symbol   string `json:"symbol"`
 		Brackets []struct {
-			InitialLeverage int    `json:"initialLeverage"`
-			NotionalCap     any    `json:"notionalCap"`
-			NotionalFloor   any    `json:"notionalFloor"`
+			InitialLeverage int `json:"initialLeverage"`
+			NotionalCap     any `json:"notionalCap"`
+			NotionalFloor   any `json:"notionalFloor"`
 		} `json:"brackets"`
 	}
 	if err := json.Unmarshal(raw, &rows); err != nil {
