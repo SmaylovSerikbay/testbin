@@ -455,6 +455,7 @@ type hub struct {
 	// Анти-фейк: рост от первой квалиф. сделки в окне (не только от min к last) + мин. число тейкер-баёв
 	aggMinLastOverFirstPct float64 // 0 = выкл; last ≥ first×(1+pct/100)
 	aggMinQualTrades       int     // 0 = выкл
+	aggMinSingleTradeUSDT  float64 // 0 = выкл; max одной квалиф. сделки в USDT ≥ порога («крупный тик»)
 
 	maxHold time.Duration
 
@@ -781,7 +782,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		st.aggBuf = st.aggBuf[i:]
 	}
 
-	var minP, maxP, lastQual, firstQual, sumQ float64
+	var minP, maxP, lastQual, firstQual, sumQ, maxSingleQ float64
 	var have bool
 	qualN := 0
 	for j := range st.aggBuf {
@@ -791,6 +792,9 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		}
 		qualN++
 		sumQ += pt.quoteUSDT
+		if pt.quoteUSDT > maxSingleQ {
+			maxSingleQ = pt.quoteUSDT
+		}
 		if !have {
 			minP, maxP = pt.price, pt.price
 			firstQual = pt.price
@@ -823,6 +827,9 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		if lof < h.aggMinLastOverFirstPct {
 			return
 		}
+	}
+	if h.aggMinSingleTradeUSDT > 0 && maxSingleQ < h.aggMinSingleTradeUSDT {
+		return
 	}
 	st.lastSignalAt = now
 	if h.live {
@@ -1366,6 +1373,15 @@ func main() {
 	if aggMinLof < 0 {
 		aggMinLof = 0
 	}
+	aggMinSingle := envGetFloat(em, "AGG_MIN_SINGLE_TRADE_USDT", 0)
+	if aggMinSingle < 0 {
+		aggMinSingle = 0
+	}
+	if liveTrading && aggMinSingle > 0 {
+		if msm := envGetFloat(em, "LIVE_AGG_SINGLE_TRADE_MULT", 1); msm > 1 {
+			aggMinSingle *= msm
+		}
+	}
 	aggTaker := strings.TrimSpace(envGet(em, "AGG_TAKER_BUY_ONLY", "1")) != "0"
 
 	miniEntS := strings.TrimSpace(envGet(em, "PUMP_MINI_ENTRY", ""))
@@ -1519,6 +1535,7 @@ func main() {
 		aggTakerBuy:            aggTaker,
 		aggMinLastOverFirstPct: aggMinLof,
 		aggMinQualTrades:       aggMinQualTr,
+		aggMinSingleTradeUSDT:  aggMinSingle,
 		maxHold:                maxHold,
 		live:                   false,
 		liveHedge:              liveHedge,
@@ -1633,12 +1650,16 @@ func main() {
 		if aggMinQualTr > 0 {
 			qNote = fmt.Sprintf(", ≥%d тейкер-buy", aggMinQualTr)
 		}
+		singleNote := ""
+		if aggMinSingle > 0 {
+			singleNote = fmt.Sprintf(", max-тик ≥%.0f USDT", aggMinSingle)
+		}
 		liveBoost := ""
 		if liveTrading {
 			liveBoost = " [лайв: усиленные пороги]"
 		}
-		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s%s%s, тейкер %s%s",
-			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, lofNote, qNote, taker, liveBoost)
+		aggRule = fmt.Sprintf("окно %dms, ≥%.0fk USDT, min→last ≥%.3f%%%s%s%s%s, тейкер %s%s",
+			aggWinMs, aggMinQ/1000, aggMinMv, peakNote, lofNote, qNote, singleNote, taker, liveBoost)
 	}
 	miniRule := "да"
 	if !miniEntry {
