@@ -68,6 +68,10 @@ func main() {
 	client := futures.NewClient(apiKey, secret)
 	client.SetApiEndpoint(futures.BaseApiMainUrl)
 
+	if err := hft.LoadFuturesRules(ctx, client); err != nil {
+		log.Printf("LoadFuturesRules: %v (qty/stop precision могут быть неверными)", err)
+	}
+
 	watchEnv := os.Getenv("WATCH")
 	symbols, err := hft.ResolveWatchlist(ctx, client, maxSym, watchEnv)
 	if err != nil {

@@ -94,11 +94,15 @@ func marketOpen(ctx context.Context, c *futures.Client, symbol string, side futu
 	orderGate.Lock()
 	defer orderGate.Unlock()
 	return With429Retry(ctx, func() error {
-		_, err := c.NewCreateOrderService().
+		qtyAdj, err := AdjustMarketQty(ctx, c, symbol, qty)
+		if err != nil {
+			return err
+		}
+		_, err = c.NewCreateOrderService().
 			Symbol(symbol).
 			Side(side).
 			Type(futures.OrderTypeMarket).
-			Quantity(qty).
+			Quantity(qtyAdj).
 			Do(ctx)
 		if err != nil {
 			return err
@@ -125,13 +129,13 @@ func placeLongBracket(ctx context.Context, c *futures.Client, symbol string, ent
 	sl := entry * (1 - SLPriceMove)
 	return With429Retry(ctx, func() error {
 		_, err := c.NewCreateOrderService().Symbol(symbol).Side(futures.SideTypeSell).
-			Type(futures.OrderTypeTakeProfitMarket).StopPrice(strconv.FormatFloat(tp, 'f', -1, 64)).
+			Type(futures.OrderTypeTakeProfitMarket).StopPrice(FormatStopPrice(symbol, tp)).
 			ClosePosition(true).WorkingType(futures.WorkingTypeContractPrice).Do(ctx)
 		if err != nil {
 			return err
 		}
 		_, err = c.NewCreateOrderService().Symbol(symbol).Side(futures.SideTypeSell).
-			Type(futures.OrderTypeStopMarket).StopPrice(strconv.FormatFloat(sl, 'f', -1, 64)).
+			Type(futures.OrderTypeStopMarket).StopPrice(FormatStopPrice(symbol, sl)).
 			ClosePosition(true).WorkingType(futures.WorkingTypeContractPrice).Do(ctx)
 		return err
 	})
@@ -142,13 +146,13 @@ func placeShortBracket(ctx context.Context, c *futures.Client, symbol string, en
 	sl := entry * (1 + SLPriceMove)
 	return With429Retry(ctx, func() error {
 		_, err := c.NewCreateOrderService().Symbol(symbol).Side(futures.SideTypeBuy).
-			Type(futures.OrderTypeTakeProfitMarket).StopPrice(strconv.FormatFloat(tp, 'f', -1, 64)).
+			Type(futures.OrderTypeTakeProfitMarket).StopPrice(FormatStopPrice(symbol, tp)).
 			ClosePosition(true).WorkingType(futures.WorkingTypeContractPrice).Do(ctx)
 		if err != nil {
 			return err
 		}
 		_, err = c.NewCreateOrderService().Symbol(symbol).Side(futures.SideTypeBuy).
-			Type(futures.OrderTypeStopMarket).StopPrice(strconv.FormatFloat(sl, 'f', -1, 64)).
+			Type(futures.OrderTypeStopMarket).StopPrice(FormatStopPrice(symbol, sl)).
 			ClosePosition(true).WorkingType(futures.WorkingTypeContractPrice).Do(ctx)
 		return err
 	})
@@ -173,13 +177,13 @@ func ApplyTrailLongAfter15PctROE(ctx context.Context, c *futures.Client, symbol 
 			return err
 		}
 		_, err := c.NewCreateOrderService().Symbol(symbol).Side(futures.SideTypeSell).
-			Type(futures.OrderTypeTakeProfitMarket).StopPrice(strconv.FormatFloat(tp, 'f', -1, 64)).
+			Type(futures.OrderTypeTakeProfitMarket).StopPrice(FormatStopPrice(symbol, tp)).
 			ClosePosition(true).WorkingType(futures.WorkingTypeContractPrice).Do(ctx)
 		if err != nil {
 			return err
 		}
 		_, err = c.NewCreateOrderService().Symbol(symbol).Side(futures.SideTypeSell).
-			Type(futures.OrderTypeStopMarket).StopPrice(strconv.FormatFloat(stop, 'f', -1, 64)).
+			Type(futures.OrderTypeStopMarket).StopPrice(FormatStopPrice(symbol, stop)).
 			ClosePosition(true).WorkingType(futures.WorkingTypeContractPrice).Do(ctx)
 		return err
 	})
@@ -204,13 +208,13 @@ func ApplyTrailShortAfter15PctROE(ctx context.Context, c *futures.Client, symbol
 			return err
 		}
 		_, err := c.NewCreateOrderService().Symbol(symbol).Side(futures.SideTypeBuy).
-			Type(futures.OrderTypeTakeProfitMarket).StopPrice(strconv.FormatFloat(tp, 'f', -1, 64)).
+			Type(futures.OrderTypeTakeProfitMarket).StopPrice(FormatStopPrice(symbol, tp)).
 			ClosePosition(true).WorkingType(futures.WorkingTypeContractPrice).Do(ctx)
 		if err != nil {
 			return err
 		}
 		_, err = c.NewCreateOrderService().Symbol(symbol).Side(futures.SideTypeBuy).
-			Type(futures.OrderTypeStopMarket).StopPrice(strconv.FormatFloat(stop, 'f', -1, 64)).
+			Type(futures.OrderTypeStopMarket).StopPrice(FormatStopPrice(symbol, stop)).
 			ClosePosition(true).WorkingType(futures.WorkingTypeContractPrice).Do(ctx)
 		return err
 	})

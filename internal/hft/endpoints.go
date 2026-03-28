@@ -40,4 +40,5 @@ func ApplyBinanceEndpoints() {
 		base := strings.TrimSuffix(u, "/ws")
 		futures.BaseCombinedMainURL = base + "/stream?streams="
 	}
+	refreshNotionalFloorForOrders()
 }
