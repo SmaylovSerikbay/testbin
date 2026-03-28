@@ -849,11 +849,23 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 				st.slBelowCnt = 0
 			}
 		}
-		// Фиксация плюса: либо net USDT, либо % на маржу (как в логе) — что наступит раньше после bankMinHold.
+		// Фиксация плюса: либо net USDT, либо % на маржу — после bankMinHold.
+		// Буфер: netEst уже с RT-комиссией в модели, но MARKET на закрытии даёт проскальзывание — без буфера бывают
+		// «BANK» по краткому движению mark, а fill около входа → в логе минус (как entry=exit при BANK).
 		bankHoldOK := h.bankMinHold <= 0 || now.Sub(st.openedAt) >= h.bankMinHold
 		if bankHoldOK {
-			bankHit := (h.bankNetUSDT > 0 && netEst >= h.bankNetUSDT) ||
-				(h.bankMarginPct > 0 && h.marginUSDT > 1e-12 && netEst/h.marginUSDT*100 >= h.bankMarginPct)
+			bankBuf := 0.005 + h.feeRT*st.notional
+			if bankBuf < 0.008 {
+				bankBuf = 0.008
+			}
+			effMar := h.marginUSDT
+			if st.posLev > 0 && st.notional > 0 {
+				if em := st.notional / float64(st.posLev); em > 1e-9 {
+					effMar = em
+				}
+			}
+			bankHit := (h.bankNetUSDT > 0 && netEst >= h.bankNetUSDT+bankBuf) ||
+				(h.bankMarginPct > 0 && effMar > 1e-12 && netEst >= bankBuf && netEst/effMar*100 >= h.bankMarginPct)
 			if bankHit {
 				h.triggerClose(st, sym, "BANK", pxEval, now)
 				return
