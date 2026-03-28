@@ -38,7 +38,8 @@ func main() {
 		log.Fatal("BINANCE_API_KEY / BINANCE_API_SECRET обязательны")
 	}
 
-	maxSym := 8
+	// Сколько пар одновременно (на каждую — 2 WS). «Все 400» = сотни соединений и лимиты Binance.
+	maxSym := 12
 	if s := os.Getenv("UNIVERSE_SIZE"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil && n > 0 {
 			maxSym = n
@@ -69,6 +70,7 @@ func main() {
 	if len(symbols) == 0 {
 		log.Fatal("пустой список символов")
 	}
+	log.Printf("Список наблюдения: %d символов (топ по объёму среди PERPETUAL USDT + живой bookTicker)", len(symbols))
 
 	for _, sym := range symbols {
 		if err := hft.SetupSymbol(ctx, client, sym); err != nil {
