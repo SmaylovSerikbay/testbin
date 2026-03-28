@@ -265,6 +265,8 @@ type symState struct {
 	opening      bool // в процессе выставления лайв-ордера
 	closing      bool // в процессе закрытия лайв-ордера
 	posLev       int  // фактическое плечо лайв-позиции (0 = симуляция / не задано)
+	peakPx       float64 // максимум цены в позиции (для трейлинга)
+	trailArmed   bool    // был ли откат от пика после «настоящего» движения (с учётом комиссии)
 
 	retBuf   []float64 // кольцо: % изменения цены за тик (~1 с)
 	dqBuf    []float64 // кольцо: Δq USDT за тик; 0 = нет данных за эту секунду
@@ -273,6 +275,8 @@ type symState struct {
 
 	// aggTrade: скользящее окно последних сделок (по времени T с биржи)
 	aggBuf []aggPt
+
+	flashBuf []flashSample // только в позиции: недавние цены для FLASH-выхода
 }
 
 type aggPt struct {
@@ -282,8 +286,57 @@ type aggPt struct {
 	buyerMaker bool
 }
 
+// flashSample — точки для детектора резкого слива за секунду-две (мини-тикер).
+type flashSample struct {
+	t time.Time
+	p float64
+}
+
 func priceMoveForMarginPct(marginPct float64, lev float64) float64 {
 	return (marginPct / 100) / lev
+}
+
+func (h *hub) pushFlashSample(st *symState, now time.Time, price float64) {
+	if h.flashWindow <= 0 {
+		return
+	}
+	st.flashBuf = append(st.flashBuf, flashSample{t: now, p: price})
+	cutoff := now.Add(-h.flashWindow)
+	i := 0
+	for i < len(st.flashBuf) && st.flashBuf[i].t.Before(cutoff) {
+		i++
+	}
+	if i > 0 {
+		copy(st.flashBuf, st.flashBuf[i:])
+		st.flashBuf = st.flashBuf[:len(st.flashBuf)-i]
+	}
+	if len(st.flashBuf) > 48 {
+		st.flashBuf = st.flashBuf[len(st.flashBuf)-48:]
+	}
+}
+
+// checkFlashDump — всплеск вниз внутри короткого окна (манипуляция / резкий разворот).
+func (h *hub) checkFlashDump(st *symState, price float64, now time.Time) bool {
+	if h.flashWindow <= 0 || len(st.flashBuf) < 2 {
+		return false
+	}
+	var maxP float64
+	for _, s := range st.flashBuf {
+		if s.p > maxP {
+			maxP = s.p
+		}
+	}
+	if h.flashDropFrac > 0 && maxP > 0 && price <= maxP*(1-h.flashDropFrac) {
+		return true
+	}
+	old := st.flashBuf[0]
+	if now.Sub(old.t) < h.flashMinSpan || old.p <= 0 {
+		return false
+	}
+	if h.flashSlopeFrac > 0 && (price-old.p)/old.p <= -h.flashSlopeFrac {
+		return true
+	}
+	return false
 }
 
 // ---- WS ----
@@ -412,6 +465,25 @@ type hub struct {
 
 	// лайв: доля доступного баланса под новую позицию (0.88 = оставить запас под IM/комиссии)
 	liveMarginFrac float64
+
+	// выход «под памп»: быстрый scratch, трейлинг от пика, комиссия в пороге трейла
+	scratchDur    time.Duration // 0 = выкл
+	scratchPull   float64       // доля цены: ниже входа на столько — «не угадали памп»
+	trailBack     float64       // откат от peakPx для фиксации
+	trailFeeExtra float64       // сверх оценки round-trip комиссии для включения трейла (доля)
+
+	// резкий «слив» после накачки: окно мини-тикера (часто ~1 с), быстрее обычного SL
+	flashWindow    time.Duration // 0 = выкл
+	flashDropFrac  float64       // цена ниже max в окне на эту долю → FLASH
+	flashSlopeFrac float64       // падение от самой старой точки окна за min span → FLASH
+	flashMinSpan   time.Duration
+
+	// страховки лайва (новые входы)
+	entriesPaused      atomic.Bool
+	maxSessionLossUSDT float64 // суммарный PnL сессии ≤ -X → стоп входов (0 = выкл)
+	minAvailToTrade    float64 // не открывать если available ниже (0 = выкл)
+	maxConsecLosses    int     // подряд убыточных сделок (0 = выкл)
+	consecLoss         atomic.Int32
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -478,43 +550,44 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 		tpMove := priceMoveForMarginPct(h.tpMarginPct, levM)
 		slMove := priceMoveForMarginPct(h.slMarginPct, levM)
 		tpFrac := 1 + tpMove
+
+		if price > st.peakPx {
+			st.peakPx = price
+		}
+		var feeFrac float64
+		if st.qty > 0 && st.entry > 0 {
+			feeFrac = (h.feeRT * st.notional) / (st.qty * st.entry)
+		}
+		trailOnFrac := feeFrac + h.trailFeeExtra
+		if st.peakPx >= st.entry*(1+trailOnFrac) {
+			st.trailArmed = true
+		}
+
+		h.pushFlashSample(st, now, price)
+		if h.checkFlashDump(st, price, now) {
+			h.triggerClose(st, sym, "FLASH", price, now)
+			return
+		}
+
 		if h.maxHold > 0 && now.Sub(st.openedAt) >= h.maxHold {
-			if h.live {
-				if st.closing {
-					return
-				}
-				st.closing = true
-				go h.doCloseAsync(sym, st, "TIME", price, now)
-				return
-			}
-			pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
-			h.closeTrade(st, sym, "TIME", price, pnl, now)
+			h.triggerClose(st, sym, "TIME", price, now)
+			return
+		}
+		if h.scratchDur > 0 && now.Sub(st.openedAt) < h.scratchDur && !st.trailArmed &&
+			st.peakPx < st.entry*(1+trailOnFrac) && price <= st.entry*(1-h.scratchPull) {
+			h.triggerClose(st, sym, "SCRATCH", price, now)
+			return
+		}
+		if st.trailArmed && st.peakPx > 0 && price <= st.peakPx*(1-h.trailBack) {
+			h.triggerClose(st, sym, "TRAIL", price, now)
 			return
 		}
 		if price >= st.entry*tpFrac {
-			if h.live {
-				if st.closing {
-					return
-				}
-				st.closing = true
-				go h.doCloseAsync(sym, st, "TP", price, now)
-				return
-			}
-			pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
-			h.closeTrade(st, sym, "TP", price, pnl, now)
+			h.triggerClose(st, sym, "TP", price, now)
 			return
 		}
 		if price <= st.entry*(1-slMove) {
-			if h.live {
-				if st.closing {
-					return
-				}
-				st.closing = true
-				go h.doCloseAsync(sym, st, "SL", price, now)
-				return
-			}
-			pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
-			h.closeTrade(st, sym, "SL", price, pnl, now)
+			h.triggerClose(st, sym, "SL", price, now)
 			return
 		}
 		st.lastPrice, st.haveLast = price, true
@@ -627,7 +700,7 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 		st.pumpArmCnt = 0
 		st.lastSignalAt = now
 		if h.live {
-			if st.opening || st.inPos {
+			if h.entriesPaused.Load() || st.opening || st.inPos {
 				return
 			}
 			st.opening = true
@@ -696,7 +769,7 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 	}
 	st.lastSignalAt = now
 	if h.live {
-		if st.opening || st.inPos {
+		if h.entriesPaused.Load() || st.opening || st.inPos {
 			return
 		}
 		st.opening = true
@@ -720,6 +793,9 @@ func (st *symState) openSim(price float64, now time.Time) {
 	st.entry = price
 	st.qty = st.notional / price
 	st.openedAt = now
+	st.peakPx = price
+	st.trailArmed = false
+	st.flashBuf = st.flashBuf[:0]
 }
 
 func (h *hub) closeTrade(st *symState, sym, reason string, exitPrice float64, pnl float64, now time.Time) {
@@ -737,12 +813,60 @@ func (h *hub) closeTrade(st *symState, sym, reason string, exitPrice float64, pn
 	st.entry = 0
 	st.qty = 0
 	st.posLev = 0
+	st.peakPx = 0
+	st.trailArmed = false
+	st.flashBuf = st.flashBuf[:0]
 	st.pumpArmCnt = 0
+	if h.live {
+		h.applyLiveGuards(pnl)
+	}
+}
+
+func (h *hub) pauseLiveEntries(reason string) {
+	if !h.entriesPaused.CompareAndSwap(false, true) {
+		return
+	}
+	log.Printf("СТОП-ВХОДЫ: %s — новые сделки отключены (открытая позиция закрывается по правилам). Перезапуск бота сбрасывает стоп.", reason)
+}
+
+func (h *hub) applyLiveGuards(lastPnl float64) {
+	if lastPnl < -1e-12 {
+		n := h.consecLoss.Add(1)
+		if h.maxConsecLosses > 0 && int(n) >= h.maxConsecLosses {
+			h.pauseLiveEntries(fmt.Sprintf("серия убытков %d подряд", n))
+		}
+	} else {
+		h.consecLoss.Store(0)
+	}
+	tot := float64FromBits(h.totalPnL.Load())
+	if h.maxSessionLossUSDT > 0 && tot <= -h.maxSessionLossUSDT {
+		h.pauseLiveEntries(fmt.Sprintf("суммарный PnL сессии %.4f USDT (лимит −%.4f)", tot, h.maxSessionLossUSDT))
+	}
+}
+
+func (h *hub) triggerClose(st *symState, sym, reason string, price float64, now time.Time) {
+	if h.live {
+		if st.closing {
+			return
+		}
+		st.closing = true
+		go h.doCloseAsync(sym, st, reason, price, now)
+		return
+	}
+	pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
+	h.closeTrade(st, sym, reason, price, pnl, now)
 }
 
 func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
+
+	if h.entriesPaused.Load() {
+		st.mu.Lock()
+		st.opening = false
+		st.mu.Unlock()
+		return
+	}
 
 	h.restMu.Lock()
 	if int(h.openCnt.Load()) >= h.liveMaxPos {
@@ -775,6 +899,14 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		if capM < effMargin {
 			effMargin = capM
 		}
+	}
+	if h.minAvailToTrade > 0 && avail > 0 && avail < h.minAvailToTrade {
+		h.restMu.Unlock()
+		st.mu.Lock()
+		st.opening = false
+		st.mu.Unlock()
+		log.Printf("[%s] пропуск: доступно %.4f < LIVE_MIN_AVAILABLE_USDT=%.4f", sym, avail, h.minAvailToTrade)
+		return
 	}
 	if effMargin < 0.02 {
 		h.restMu.Unlock()
@@ -818,6 +950,9 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 	st.openedAt = now
 	st.posLev = useLev
 	st.notional = effNotional
+	st.peakPx = st.entry
+	st.trailArmed = false
+	st.flashBuf = st.flashBuf[:0]
 	h.openCnt.Add(1)
 	log.Printf("[%s] открыт лонг qty=%.8f avg=%.8f плечо=%d×", sym, q, st.entry, useLev)
 }
@@ -1160,6 +1295,62 @@ func main() {
 		maxHold = time.Duration(maxHoldSec) * time.Second
 	}
 
+	scratchSec := envGetInt(em, "PUMP_SCRATCH_SEC", 22)
+	var scratchDur time.Duration
+	if scratchSec > 0 {
+		scratchDur = time.Duration(scratchSec) * time.Second
+	}
+	scratchPull := envGetFloat(em, "PUMP_SCRATCH_PULL_PCT", 0.35) / 100
+	if scratchPull < 0 {
+		scratchPull = 0
+	}
+	if scratchPull == 0 && scratchDur > 0 {
+		scratchPull = 0.003
+	}
+	trailBack := envGetFloat(em, "PUMP_TRAIL_BACK_PCT", 0.45) / 100
+	if trailBack <= 0 {
+		trailBack = 0.0045
+	}
+	trailFeeExtra := envGetFloat(em, "PUMP_TRAIL_FEE_EXTRA_PCT", 0.06) / 100
+	if trailFeeExtra < 0 {
+		trailFeeExtra = 0
+	}
+
+	flashMs := envGetInt(em, "PUMP_FLASH_MS", 1200)
+	if flashMs > 0 && flashMs < 250 {
+		flashMs = 250
+	}
+	var flashWindow time.Duration
+	if flashMs > 0 {
+		flashWindow = time.Duration(flashMs) * time.Millisecond
+	}
+	flashDrop := envGetFloat(em, "PUMP_FLASH_DROP_PCT", 0.22) / 100
+	if flashDrop < 0 {
+		flashDrop = 0
+	}
+	flashSlope := envGetFloat(em, "PUMP_FLASH_SLOPE_PCT", 0.18) / 100
+	if flashSlope < 0 {
+		flashSlope = 0
+	}
+	flashMinMs := envGetInt(em, "PUMP_FLASH_MIN_MS", 350)
+	if flashMinMs < 80 {
+		flashMinMs = 80
+	}
+	flashMinSpan := time.Duration(flashMinMs) * time.Millisecond
+
+	maxSessLoss := envGetFloat(em, "LIVE_MAX_SESSION_LOSS_USDT", 2.5)
+	if maxSessLoss < 0 {
+		maxSessLoss = 0
+	}
+	minAvailTrade := envGetFloat(em, "LIVE_MIN_AVAILABLE_USDT", 0.35)
+	if minAvailTrade < 0 {
+		minAvailTrade = 0
+	}
+	maxConsecLoss := envGetInt(em, "LIVE_MAX_CONSECUTIVE_LOSSES", 5)
+	if maxConsecLoss < 0 {
+		maxConsecLoss = 0
+	}
+
 	liveTrading := strings.TrimSpace(envGet(em, "LIVE_TRADING", "")) == "1"
 	liveMaxPos := envGetInt(em, "LIVE_MAX_POSITIONS", 1)
 	if liveMaxPos < 1 {
@@ -1210,6 +1401,17 @@ func main() {
 		liveMaxPos:       liveMaxPos,
 		levInt:           levInt,
 		liveMarginFrac:   liveMarginFrac,
+		scratchDur:       scratchDur,
+		scratchPull:        scratchPull,
+		trailBack:          trailBack,
+		trailFeeExtra:      trailFeeExtra,
+		flashWindow:        flashWindow,
+		flashDropFrac:      flashDrop,
+		flashSlopeFrac:     flashSlope,
+		flashMinSpan:       flashMinSpan,
+		maxSessionLossUSDT: maxSessLoss,
+		minAvailToTrade:    minAvailTrade,
+		maxConsecLosses:    maxConsecLoss,
 	}
 
 	if liveTrading {
@@ -1222,10 +1424,31 @@ func main() {
 		if err := fc.loadLotSpecs(ctx); err != nil {
 			log.Fatalf("exchangeInfo (лайв): %v", err)
 		}
+		pw, pc := context.WithTimeout(ctx, 5*time.Second)
+		if lat, err := fc.WarmupPing(pw); err != nil {
+			log.Printf("FAPI прогрев ping: %v", err)
+		} else {
+			log.Printf("FAPI прогрев: ping за %v (HTTP/2 + keep-alive для ордеров)", lat.Round(time.Millisecond))
+		}
+		pc()
 		h.fapi = fc
 		h.live = true
-		log.Printf("РЕЖИМ ЛАЙВ: реальные MARKET-ордера на %s | max одновременных позиций=%d | hedge=%v | плечо=%d× | буфер маржи %.0f%% доступного",
-			baseREST, liveMaxPos, liveHedge, levInt, bufPct)
+		var guardParts []string
+		if maxSessLoss > 0 {
+			guardParts = append(guardParts, fmt.Sprintf("стоп при ΣPnL≤−%.2f USDT", maxSessLoss))
+		}
+		if minAvailTrade > 0 {
+			guardParts = append(guardParts, fmt.Sprintf("вход только если avail≥%.2f", minAvailTrade))
+		}
+		if maxConsecLoss > 0 {
+			guardParts = append(guardParts, fmt.Sprintf("стоп после %d убытков подряд", maxConsecLoss))
+		}
+		guardStr := "страховки нет (задайте LIVE_MAX_SESSION_LOSS_USDT и т.д.)"
+		if len(guardParts) > 0 {
+			guardStr = strings.Join(guardParts, "; ")
+		}
+		log.Printf("РЕЖИМ ЛАЙВ: %s | MARKET %s | max поз=%d | hedge=%v | %d× | буфер %.0f%%",
+			guardStr, baseREST, liveMaxPos, liveHedge, levInt, bufPct)
 		bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
 		if w, av, err := fc.FuturesUSDTBalance(bctx); err != nil {
 			log.Printf("баланс USDT-M: не удалось прочитать: %v", err)
@@ -1289,6 +1512,17 @@ func main() {
 	}
 	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
 		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100)
+	scratchStr := "выкл"
+	if scratchDur > 0 {
+		scratchStr = fmt.Sprintf("первые %s, ниже входа на ≥%.2f%% без «подтверждения»", scratchDur.String(), scratchPull*100)
+	}
+	flashStr := "выкл"
+	if flashWindow > 0 {
+		flashStr = fmt.Sprintf("окно %v: просадка от max в окне ≥%.2f%% или наклон ≥%.2f%% за ≥%v",
+			flashWindow, flashDrop*100, flashSlope*100, flashMinSpan)
+	}
+	log.Printf("Выход по позиции: FLASH=%s | SCRATCH=%s | TRAIL: откат от пика ≥%.2f%% после роста ≥ round-trip комиссия + %.3f%% | TP-потолок +%.4f%% | SL −%.4f%%",
+		flashStr, scratchStr, trailBack*100, trailFeeExtra*100, tpMove*100, slMove*100)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
@@ -1306,12 +1540,16 @@ func main() {
 					sctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 					w, av, err := h.fapi.FuturesUSDTBalance(sctx)
 					cancel()
+					blk := ""
+					if h.entriesPaused.Load() {
+						blk = " | ВХОДЫ ЗАБЛОКИРОВАНЫ (страховка)"
+					}
 					if err != nil {
-						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв] | баланс: %v",
-							h.closedTrades.Load(), pnl, err)
+						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s | баланс: %v",
+							h.closedTrades.Load(), pnl, blk, err)
 					} else {
-						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв] | USDT-M кошелёк=%.4f доступно=%.4f",
-							h.closedTrades.Load(), pnl, w, av)
+						log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT [лайв]%s | USDT-M кошелёк=%.4f доступно=%.4f",
+							h.closedTrades.Load(), pnl, blk, w, av)
 					}
 				} else {
 					log.Printf("STATS: сделок=%d суммарный PnL=%.4f USDT (симуляция)",

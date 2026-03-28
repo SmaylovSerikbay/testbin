@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -36,8 +37,9 @@ type fapiClient struct {
 }
 
 type lotSpec struct {
-	step float64
-	minQ float64
+	step   float64
+	minQ   float64
+	minNtl float64 // MIN_NOTIONAL в USDT (новые правила ~5)
 }
 
 type fapiOrderResp struct {
@@ -53,16 +55,54 @@ type fapiOrderResp struct {
 	PositionSide string `json:"positionSide"`
 }
 
+func fastFuturesTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   4 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   128,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   8 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+}
+
 func newFAPIClient(baseREST, apiKey, apiSecret string) *fapiClient {
 	return &fapiClient{
 		base:   strings.TrimSuffix(baseREST, "/"),
 		key:    apiKey,
 		secret: apiSecret,
-		httpc:  &http.Client{Timeout: 25 * time.Second},
+		httpc: &http.Client{
+			Transport: fastFuturesTransport(),
+			Timeout:   25 * time.Second,
+		},
 		lots:        make(map[string]lotSpec),
 		levOK:       make(map[string]int),
 		bracketMaxL: make(map[string]int),
 	}
+}
+
+// WarmupPing — прогрев TLS/TCP и пула к FAPI (меньше задержка на первом ордере).
+func (c *fapiClient) WarmupPing(ctx context.Context) (time.Duration, error) {
+	t0 := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/fapi/v1/ping", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return time.Since(t0), fmt.Errorf("ping HTTP %d", resp.StatusCode)
+	}
+	return time.Since(t0), nil
 }
 
 func (c *fapiClient) loadLotSpecs(ctx context.Context) error {
@@ -90,9 +130,11 @@ func (c *fapiClient) loadLotSpecs(ctx context.Context) error {
 		Symbols []struct {
 			Symbol  string `json:"symbol"`
 			Filters []struct {
-				FilterType string `json:"filterType"`
-				MinQty     string `json:"minQty"`
-				StepSize   string `json:"stepSize"`
+				FilterType  string `json:"filterType"`
+				MinQty      string `json:"minQty"`
+				StepSize    string `json:"stepSize"`
+				Notional    string `json:"notional"`
+				MinNotional string `json:"minNotional"`
 			} `json:"filters"`
 		} `json:"symbols"`
 	}
@@ -124,7 +166,25 @@ func (c *fapiClient) loadLotSpecs(ctx context.Context) error {
 		if e1 != nil || e2 != nil || step <= 0 || minQ < 0 {
 			continue
 		}
-		tmp[s.Symbol] = lotSpec{step: step, minQ: minQ}
+		minNtl := 5.0
+		for _, f := range s.Filters {
+			if f.FilterType != "MIN_NOTIONAL" && f.FilterType != "NOTIONAL" {
+				continue
+			}
+			if f.Notional != "" {
+				if v, e := strconv.ParseFloat(f.Notional, 64); e == nil && v > 0 {
+					minNtl = v
+					break
+				}
+			}
+			if f.MinNotional != "" {
+				if v, e := strconv.ParseFloat(f.MinNotional, 64); e == nil && v > 0 {
+					minNtl = v
+					break
+				}
+			}
+		}
+		tmp[s.Symbol] = lotSpec{step: step, minQ: minQ, minNtl: minNtl}
 	}
 	c.lotMu.Lock()
 	c.lots = tmp
@@ -147,6 +207,13 @@ func roundQtyDown(q, step float64) float64 {
 		return q
 	}
 	return math.Floor(q/step+1e-12) * step
+}
+
+func roundQtyCeil(q, step float64) float64 {
+	if step <= 0 {
+		return q
+	}
+	return math.Ceil(q/step-1e-12) * step
 }
 
 func formatQtyString(q float64, step float64) string {
@@ -530,6 +597,21 @@ func (c *fapiClient) PrepareQtyBuy(symbol string, notionalUSDT, refPrice float64
 	qty = roundQtyDown(raw, ls.step)
 	if qty < ls.minQ {
 		return "", 0, fmt.Errorf("qty %.8f < minQty %.8f для %s", qty, ls.minQ, symbol)
+	}
+	minN := ls.minNtl
+	if minN <= 0 {
+		minN = 5
+	}
+	need := roundQtyCeil(minN/refPrice, ls.step)
+	if need < ls.minQ {
+		need = ls.minQ
+	}
+	if qty < need {
+		qty = need
+	}
+	if qty*refPrice > notionalUSDT+1e-8 {
+		return "", 0, fmt.Errorf("min notional %.2f USDT требует ~%.4f монет при цене %.8f, бюджет %.2f USDT (%s)",
+			minN, need, refPrice, notionalUSDT, symbol)
 	}
 	return formatQtyString(qty, ls.step), qty, nil
 }
