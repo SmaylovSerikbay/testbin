@@ -31,9 +31,10 @@ const (
 	tpMarginPct    = 60.0 // тейк-профит в % от маржи
 	slMarginPct    = 15.0 // стоп в % от маржи
 	feeRoundTrip   = 0.0008 // ~0.04% вход + выход на нотиoнал (оценка)
-	minSymbols     = 400
-	streamsPerConn = 120 // чанки URL + нагрузка на один сокет
-	readDeadLine   = 60 * time.Second
+	minSymbols        = 400
+	defaultStreamsConn = 120
+	defaultWSDeadlineS = 60
+	defaultStatsSec    = 10
 
 	// «Реальный» памп: нижняя планка по цене, если истории ещё мало
 	defaultPumpFloorPct = 0.18
@@ -108,6 +109,14 @@ func envGetInt(m envMap, key string, def int) int {
 		return def
 	}
 	return x
+}
+
+func envGetDurationSec(em envMap, key string, defSec int) time.Duration {
+	n := envGetInt(em, key, defSec)
+	if n <= 0 {
+		n = defSec
+	}
+	return time.Duration(n) * time.Second
 }
 
 func medianSorted(s []float64) float64 {
@@ -500,7 +509,7 @@ func streamsURL(baseWS string, syms []string) string {
 	return b.String()
 }
 
-func runConnection(ctx context.Context, url string, h *hub, wg *sync.WaitGroup) {
+func runConnection(ctx context.Context, url string, h *hub, readDeadline time.Duration, wg *sync.WaitGroup) {
 	defer wg.Done()
 	d := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
@@ -526,9 +535,9 @@ func runConnection(ctx context.Context, url string, h *hub, wg *sync.WaitGroup) 
 			continue
 		}
 		backoff = time.Second
-		conn.SetReadDeadline(time.Now().Add(readDeadLine))
+		conn.SetReadDeadline(time.Now().Add(readDeadline))
 		conn.SetPongHandler(func(string) error {
-			conn.SetReadDeadline(time.Now().Add(readDeadLine))
+			conn.SetReadDeadline(time.Now().Add(readDeadline))
 			return nil
 		})
 		go func() {
@@ -559,7 +568,7 @@ func runConnection(ctx context.Context, url string, h *hub, wg *sync.WaitGroup) 
 				readLoop = false
 				break
 			}
-			conn.SetReadDeadline(time.Now().Add(readDeadLine))
+			conn.SetReadDeadline(time.Now().Add(readDeadline))
 			now := time.Now()
 			sym, px, qv, ok := parseMiniPayload(msg)
 			if !ok {
@@ -616,9 +625,18 @@ func main() {
 		cd = time.Duration(cdSec) * time.Second
 	}
 	symsMin := envGetInt(em, "MIN_SYMBOLS", minSymbols)
-	if symsMin < minSymbols {
+	if symsMin < 1 {
 		symsMin = minSymbols
 	}
+	streamsConn := envGetInt(em, "STREAMS_PER_CONN", defaultStreamsConn)
+	if streamsConn < 30 {
+		streamsConn = 30
+	}
+	if streamsConn > 300 {
+		streamsConn = 300
+	}
+	readDeadline := envGetDurationSec(em, "WS_READ_DEADLINE_SEC", defaultWSDeadlineS)
+	statsEvery := envGetDurationSec(em, "STATS_INTERVAL_SEC", defaultStatsSec)
 	m := envGetFloat(em, "MARGIN_USDT", marginUSDT)
 	lev := envGetFloat(em, "LEVERAGE", leverage)
 	tpm := envGetFloat(em, "TP_MARGIN_PCT", tpMarginPct)
@@ -662,18 +680,18 @@ func main() {
 		h.states.Store(s, &symState{notional: m * lev})
 	}
 
-	batches := chunkStrings(symbols, streamsPerConn)
+	batches := chunkStrings(symbols, streamsConn)
 	var wg sync.WaitGroup
 	for _, b := range batches {
 		u := streamsURL(baseWS, b)
 		wg.Add(1)
-		go runConnection(ctx, u, h, &wg)
+		go runConnection(ctx, u, h, readDeadline, &wg)
 	}
 
 	log.Printf("WS: %s — conn=%d streams/sock≤%d | «реальный» памп: цена ≥ max(%.2f%%, floor %.2f%%, %.1f×med|1s|), Δq ≥ max(%.0fk, %.1f×medΔq), окно=%d разгон=%d тик max=%.1f%% подряд=%d cooldown=%s | симуляция $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
-		baseWS, len(batches), streamsPerConn, pumpPct, pumpFloor, retMult, minQD/1000, volMult, histLen, warmup, maxPump, pticks, cd, m, lev, tpm, slm, tpMove*100, slMove*100)
+		baseWS, len(batches), streamsConn, pumpPct, pumpFloor, retMult, minQD/1000, volMult, histLen, warmup, maxPump, pticks, cd, m, lev, tpm, slm, tpMove*100, slMove*100)
 
-	tick := time.NewTicker(10 * time.Second)
+	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
 	go func() {
 		for {
