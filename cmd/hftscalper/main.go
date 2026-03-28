@@ -26,6 +26,12 @@ func main() {
 
 	hft.ApplyBinanceEndpoints()
 
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_RELAXED")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_RELAXED")), "true") {
+		hft.ApplyDemoRelaxed()
+		log.Println("DEMO_RELAXED: пороги стратегии снижены (больше сигналов на демо)")
+	}
+
 	apiKey := strings.TrimSpace(os.Getenv("BINANCE_API_KEY"))
 	secret := strings.TrimSpace(os.Getenv("BINANCE_API_SECRET"))
 	if apiKey == "" || secret == "" {
@@ -128,6 +134,32 @@ func main() {
 		go w.Run(ctx, flag)
 	}
 
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_SMOKE_ORDER")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_SMOKE_ORDER")), "true") {
+		smokeSym := strings.ToUpper(strings.TrimSpace(os.Getenv("SMOKE_SYMBOL")))
+		if smokeSym == "" {
+			smokeSym = symbols[0]
+		}
+		log.Printf("DEMO_SMOKE_ORDER: через 5с MARKET LONG %s qty=%s (проверка API)", smokeSym, qty)
+		go func(sym string) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+			c2, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			if err := hft.MarketOpenLong(c2, client, sym, qty); err != nil {
+				stats.SetOrderError("SMOKE: " + err.Error())
+				stats.PushImpulse("SMOKE FAIL " + sym + " " + err.Error())
+				log.Printf("SMOKE order error: %v", err)
+			} else {
+				stats.PushImpulse("SMOKE OK " + sym + " LONG")
+				log.Printf("SMOKE: ордер отправлен %s", sym)
+			}
+		}(smokeSym)
+	}
+
 	go panicKeyboard(ctx, client, symbols)
 
 	tick := time.NewTicker(900 * time.Millisecond)
@@ -153,17 +185,27 @@ func main() {
 					fmt.Println(" •", impulses[i])
 				}
 			}
+			if errTxt := stats.LastOrderError(); errTxt != "" {
+				fmt.Println("────────────────────────────────────────")
+				fmt.Println("Последняя ошибка ордера / API:")
+				fmt.Println(" ", errTxt)
+			}
 			fmt.Println("────────────────────────────────────────")
-			fmt.Println("Market heat (watch ≤45s since last hot):")
+			fmt.Println("Market heat (есть цена и «жар» ≤45с):")
 			for _, s := range symbols {
 				h := hotFlags[s].Load()
 				state := "COLD"
 				if h {
 					state = "HOT"
 				}
-				fmt.Printf("  %s  %s  px≈%.6f\n", s, state, hub.Get(s))
+				px := hub.Get(s)
+				if px <= 0 {
+					state = "NO_WS"
+				}
+				fmt.Printf("  %s  %s  px≈%.6f\n", s, state, px)
 			}
 			fmt.Println("────────────────────────────────────────")
+			fmt.Println("Подсказка: WATCH=BTCUSDT,ETHUSDT | DEMO_RELAXED=1 | DEMO_SMOKE_ORDER=1 — тестовый вход")
 			fmt.Println("Введите PANIC + Enter — закрыть всё; Ctrl+C — выход")
 		}
 	}

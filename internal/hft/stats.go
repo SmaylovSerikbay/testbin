@@ -6,12 +6,13 @@ import (
 
 // SessionStats — PnL и win rate по user stream (reduce-only).
 type SessionStats struct {
-	mu           sync.Mutex
+	mu            sync.Mutex
 	totalRealized float64
-	wins         int64
-	losses       int64
-	impulses     []string
-	impulseCap   int
+	wins          int64
+	losses        int64
+	impulses      []string
+	impulseCap    int
+	lastOrderErr  string
 }
 
 func NewSessionStats(impulseCap int) *SessionStats {
@@ -30,6 +31,24 @@ func (s *SessionStats) AddRealized(rp float64) {
 	} else if rp < -1e-8 {
 		s.losses++
 	}
+}
+
+func (s *SessionStats) SetOrderError(msg string) {
+	if msg == "" {
+		return
+	}
+	s.mu.Lock()
+	if len(msg) > 220 {
+		msg = msg[:220] + "…"
+	}
+	s.lastOrderErr = msg
+	s.mu.Unlock()
+}
+
+func (s *SessionStats) LastOrderError() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastOrderErr
 }
 
 func (s *SessionStats) PushImpulse(line string) {

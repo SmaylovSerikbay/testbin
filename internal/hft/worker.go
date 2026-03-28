@@ -2,6 +2,7 @@ package hft
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"strconv"
 	"sync"
@@ -11,20 +12,30 @@ import (
 	"github.com/adshao/go-binance/v2/futures"
 )
 
-const (
-	minTPS           = 30
-	move10sMin       = 0.001 // 0.1%
-	staleOffWatch    = 45 * time.Second
-	buySellRatio     = 3.0
-	priceUp2s        = 0.0005 // 0.05%
-	wallUSDT         = 100_000.0
-	wallWindow       = 500 * time.Millisecond
-	bbPeriod         = 10
-	bbInterval       = 5 * time.Second
-	entryDebounce    = 900 * time.Millisecond
-	topDepthLevels   = 5
-	highTPSBreakout  = 30
+// Пороги стратегии (переменные — чтобы ослабить на демо через ApplyDemoRelaxed).
+var (
+	MinTPS          = 30
+	Move10sMin      = 0.001 // 0.1% за 10с
+	StaleOffWatch   = 45 * time.Second
+	BuySellRatio    = 3.0
+	PriceUp2s       = 0.0005 // 0.05%
+	WallUSDTThresh  = 100_000.0
+	WallWindow      = 500 * time.Millisecond
+	BBPeriod        = 10
+	BBInterval      = 5 * time.Second
+	EntryDebounce   = 900 * time.Millisecond
+	TopDepthLevels  = 5
+	HighTPSBreakout = 30
 )
+
+// ApplyDemoRelaxed снижает пороги (демо-счёт, больше сигналов для проверки).
+func ApplyDemoRelaxed() {
+	MinTPS = 12
+	Move10sMin = 0.0004
+	WallUSDTThresh = 20_000
+	HighTPSBreakout = 12
+	BuySellRatio = 2.2
+}
 
 // SymbolWorker — один символ: aggTrade + depth20, фильтр «жара», триггеры.
 type SymbolWorker struct {
@@ -71,7 +82,7 @@ func NewSymbolWorker(sym string, c *futures.Client, qty string, st *SessionStats
 		Qty:         qty,
 		Stats:       st,
 		Prices:      ph,
-		lastHot:     time.Now(),
+		lastHot:     time.Time{}, // HOT только после реального «жара», не в момент старта
 		lastBarTime: time.Now(),
 	}
 }
@@ -151,7 +162,7 @@ func (w *SymbolWorker) onAggTrade(ev *futures.WsAggTradeEvent) {
 
 	tps := w.tpsLocked(ms)
 	move10 := w.move10sLocked(ms)
-	if tps >= minTPS && math.Abs(move10) >= move10sMin {
+	if tps >= MinTPS && math.Abs(move10) >= Move10sMin {
 		w.lastHot = time.Now()
 	}
 }
@@ -171,8 +182,8 @@ func (w *SymbolWorker) onDepth(ev *futures.WsDepthEvent) {
 	bp, _ := strconv.ParseFloat(ev.Bids[0].Price, 64)
 	ap, _ := strconv.ParseFloat(ev.Asks[0].Price, 64)
 	mid := (bp + ap) / 2
-	ask5 := sumNotionalAsks(ev.Asks, topDepthLevels)
-	bid5 := sumNotionalBids(ev.Bids, topDepthLevels)
+	ask5 := sumNotionalAsks(ev.Asks, TopDepthLevels)
+	bid5 := sumNotionalBids(ev.Bids, TopDepthLevels)
 	now := time.Now()
 
 	w.mu.Lock()
@@ -182,7 +193,7 @@ func (w *SymbolWorker) onDepth(ev *futures.WsDepthEvent) {
 	w.Prices.Set(w.Symbol, mid)
 
 	w.wallSnaps = append(w.wallSnaps, wallSnap{t: now, askUSDT: ask5, bidUSDT: bid5, mid: mid})
-	cut := now.Add(-wallWindow)
+	cut := now.Add(-WallWindow)
 	i := 0
 	for i < len(w.wallSnaps) && w.wallSnaps[i].t.Before(cut) {
 		i++
@@ -292,18 +303,19 @@ func (w *SymbolWorker) tickStrategy(hotOut *atomic.Bool) {
 
 	tps := w.tpsLocked(nowMs)
 	move10 := w.move10sLocked(nowMs)
-	hot := tps >= minTPS && math.Abs(move10) >= move10sMin
+	hot := tps >= MinTPS && math.Abs(move10) >= Move10sMin
 	if hot {
 		w.lastHot = now
 	}
-	activeWatch := now.Sub(w.lastHot) <= staleOffWatch
+	// В watch только если есть цена и недавно был реальный горячий режим
+	activeWatch := w.lastPrice > 0 && !w.lastHot.IsZero() && now.Sub(w.lastHot) <= StaleOffWatch
 	hotOut.Store(activeWatch)
 
 	// 5s свеча close = lastPrice
-	if now.Sub(w.lastBarTime) >= bbInterval && w.lastPrice > 0 {
+	if now.Sub(w.lastBarTime) >= BBInterval && w.lastPrice > 0 {
 		w.bbCloses = append(w.bbCloses, w.lastPrice)
-		if len(w.bbCloses) > bbPeriod+5 {
-			w.bbCloses = w.bbCloses[len(w.bbCloses)-(bbPeriod+5):]
+		if len(w.bbCloses) > BBPeriod+5 {
+			w.bbCloses = w.bbCloses[len(w.bbCloses)-(BBPeriod+5):]
 		}
 		w.lastBarTime = now
 	}
@@ -326,7 +338,7 @@ func (w *SymbolWorker) tickStrategy(hotOut *atomic.Bool) {
 		return
 	}
 
-	if time.Now().UnixNano()-w.lastEntryNano.Load() < entryDebounce.Nanoseconds() {
+	if time.Now().UnixNano()-w.lastEntryNano.Load() < EntryDebounce.Nanoseconds() {
 		return
 	}
 
@@ -334,52 +346,76 @@ func (w *SymbolWorker) tickStrategy(hotOut *atomic.Bool) {
 	defer cancel()
 
 	// Trigger 1: delta + 0.05% за 2с
-	if sellV > 1 && buyV > 3.0*sellV && p2 > 0 && px >= p2*(1+priceUp2s) {
+	if sellV > 1 && buyV > BuySellRatio*sellV && p2 > 0 && px >= p2*(1+PriceUp2s) {
 		w.lastEntryNano.Store(time.Now().UnixNano())
-		_ = MarketOpenLong(ctx, w.Client, w.Symbol, w.Qty)
-		w.Stats.PushImpulse(w.Symbol + " T1_DELTA_LONG")
+		if err := MarketOpenLong(ctx, w.Client, w.Symbol, w.Qty); err != nil {
+			w.Stats.SetOrderError(fmt.Sprintf("%s T1_LONG: %v", w.Symbol, err))
+			w.Stats.PushImpulse(w.Symbol + " ERR " + err.Error())
+			return
+		}
+		w.Stats.PushImpulse(w.Symbol + " T1_DELTA_LONG OK")
 		return
 	}
-	if buyV > 1 && sellV > 3.0*buyV && p2 > 0 && px <= p2*(1-priceUp2s) {
+	if buyV > 1 && sellV > BuySellRatio*buyV && p2 > 0 && px <= p2*(1-PriceUp2s) {
 		w.lastEntryNano.Store(time.Now().UnixNano())
-		_ = MarketOpenShort(ctx, w.Client, w.Symbol, w.Qty)
-		w.Stats.PushImpulse(w.Symbol + " T1_DELTA_SHORT")
+		if err := MarketOpenShort(ctx, w.Client, w.Symbol, w.Qty); err != nil {
+			w.Stats.SetOrderError(fmt.Sprintf("%s T1_SHORT: %v", w.Symbol, err))
+			w.Stats.PushImpulse(w.Symbol + " ERR " + err.Error())
+			return
+		}
+		w.Stats.PushImpulse(w.Symbol + " T1_DELTA_SHORT OK")
 		return
 	}
 
-	// Trigger 2: стена 100k съедена за 500ms
+	// Trigger 2: стена съедена за ~500ms
 	if len(snaps) >= 2 {
 		old := snaps[0]
 		cur := snaps[len(snaps)-1]
-		if old.askUSDT-cur.askUSDT >= wallUSDT && cur.mid > old.mid {
+		if old.askUSDT-cur.askUSDT >= WallUSDTThresh && cur.mid > old.mid {
 			w.lastEntryNano.Store(time.Now().UnixNano())
-			_ = MarketOpenLong(ctx, w.Client, w.Symbol, w.Qty)
-			w.Stats.PushImpulse(w.Symbol + " T2_WALL_BUY")
+			if err := MarketOpenLong(ctx, w.Client, w.Symbol, w.Qty); err != nil {
+				w.Stats.SetOrderError(fmt.Sprintf("%s T2_LONG: %v", w.Symbol, err))
+				w.Stats.PushImpulse(w.Symbol + " ERR " + err.Error())
+				return
+			}
+			w.Stats.PushImpulse(w.Symbol + " T2_WALL_BUY OK")
 			return
 		}
-		if old.bidUSDT-cur.bidUSDT >= wallUSDT && cur.mid < old.mid {
+		if old.bidUSDT-cur.bidUSDT >= WallUSDTThresh && cur.mid < old.mid {
 			w.lastEntryNano.Store(time.Now().UnixNano())
-			_ = MarketOpenShort(ctx, w.Client, w.Symbol, w.Qty)
-			w.Stats.PushImpulse(w.Symbol + " T2_WALL_SELL")
+			if err := MarketOpenShort(ctx, w.Client, w.Symbol, w.Qty); err != nil {
+				w.Stats.SetOrderError(fmt.Sprintf("%s T2_SHORT: %v", w.Symbol, err))
+				w.Stats.PushImpulse(w.Symbol + " ERR " + err.Error())
+				return
+			}
+			w.Stats.PushImpulse(w.Symbol + " T2_WALL_SELL OK")
 			return
 		}
 	}
 
-	// Trigger 3: Bollinger 10 на 5s, пробой + высокий TPS
-	if len(closes) >= bbPeriod && tps >= highTPSBreakout {
-		_, up, low, ok := bollinger(closes, bbPeriod)
+	// Trigger 3: Bollinger на 5s, пробой + высокий TPS
+	if len(closes) >= BBPeriod && tps >= HighTPSBreakout {
+		_, up, low, ok := bollinger(closes, BBPeriod)
 		if ok {
 			lastC := closes[len(closes)-1]
 			if lastC > up {
 				w.lastEntryNano.Store(time.Now().UnixNano())
-				_ = MarketOpenLong(ctx, w.Client, w.Symbol, w.Qty)
-				w.Stats.PushImpulse(w.Symbol + " T3_BB_UP")
+				if err := MarketOpenLong(ctx, w.Client, w.Symbol, w.Qty); err != nil {
+					w.Stats.SetOrderError(fmt.Sprintf("%s T3_LONG: %v", w.Symbol, err))
+					w.Stats.PushImpulse(w.Symbol + " ERR " + err.Error())
+					return
+				}
+				w.Stats.PushImpulse(w.Symbol + " T3_BB_UP OK")
 				return
 			}
 			if lastC < low {
 				w.lastEntryNano.Store(time.Now().UnixNano())
-				_ = MarketOpenShort(ctx, w.Client, w.Symbol, w.Qty)
-				w.Stats.PushImpulse(w.Symbol + " T3_BB_DN")
+				if err := MarketOpenShort(ctx, w.Client, w.Symbol, w.Qty); err != nil {
+					w.Stats.SetOrderError(fmt.Sprintf("%s T3_SHORT: %v", w.Symbol, err))
+					w.Stats.PushImpulse(w.Symbol + " ERR " + err.Error())
+					return
+				}
+				w.Stats.PushImpulse(w.Symbol + " T3_BB_DN OK")
 				return
 			}
 		}
