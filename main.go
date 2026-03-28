@@ -195,7 +195,7 @@ func httpGetJSON(ctx context.Context, client *http.Client, url string, out any) 
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func fetchUniverse(ctx context.Context, baseREST string, needMin int) ([]string, error) {
+func fetchUniverse(ctx context.Context, baseREST string, needMin int, minLastPrice float64) ([]string, error) {
 	client := &http.Client{Timeout: 25 * time.Second}
 	var ei exchangeInfo
 	if err := httpGetJSON(ctx, client, baseREST+"/fapi/v1/exchangeInfo", &ei); err != nil {
@@ -213,20 +213,38 @@ func fetchUniverse(ctx context.Context, baseREST string, needMin int) ([]string,
 	}
 	var tickers []ticker24
 	if err := httpGetJSON(ctx, client, baseREST+"/fapi/v1/ticker/24hr", &tickers); err != nil {
-		return cands, nil // fallback: без сортировки
+		return cands, nil // fallback: без сортировки и без фильтра по цене
 	}
 	vol := make(map[string]float64, len(tickers))
+	lastPx := make(map[string]float64, len(tickers))
 	for _, t := range tickers {
 		v, _ := strconv.ParseFloat(t.QuoteVolume, 64)
 		vol[t.Symbol] = v
+		if lp, err := strconv.ParseFloat(t.LastPrice, 64); err == nil && lp > 0 {
+			lastPx[t.Symbol] = lp
+		}
 	}
-	sort.Slice(cands, func(i, j int) bool {
-		return vol[cands[i]] > vol[cands[j]]
+	var pool []string
+	if minLastPrice <= 0 {
+		pool = cands
+	} else {
+		for _, s := range cands {
+			lp, ok := lastPx[s]
+			if ok && lp >= minLastPrice {
+				pool = append(pool, s)
+			}
+		}
+		if len(pool) == 0 {
+			return nil, fmt.Errorf("после MIN_LAST_PRICE_USDT=%.6f не осталось символов", minLastPrice)
+		}
+	}
+	sort.Slice(pool, func(i, j int) bool {
+		return vol[pool[i]] > vol[pool[j]]
 	})
-	if len(cands) > needMin {
-		cands = cands[:needMin]
+	if len(pool) > needMin {
+		pool = pool[:needMin]
 	}
-	return cands, nil
+	return pool, nil
 }
 
 // ---- Состояние по символу ----
@@ -244,6 +262,8 @@ type symState struct {
 	openedAt     time.Time
 	pumpArmCnt   int
 	lastSignalAt time.Time
+	opening      bool // в процессе выставления лайв-ордера
+	closing      bool // в процессе закрытия лайв-ордера
 
 	retBuf   []float64 // кольцо: % изменения цены за тик (~1 с)
 	dqBuf    []float64 // кольцо: Δq USDT за тик; 0 = нет данных за эту секунду
@@ -379,6 +399,15 @@ type hub struct {
 	aggTakerBuy   bool // только агрессивные покупки (!buyerMaker)
 
 	maxHold time.Duration
+
+	// Реальная торговля (REST); выход по цене с мини-тикера → MARKET reduceOnly.
+	fapi       *fapiClient
+	live       bool
+	liveHedge  bool // true = аккаунт в hedge mode (positionSide LONG)
+	liveMaxPos int
+	levInt     int
+	restMu     sync.Mutex
+	openCnt    atomic.Int32
 }
 
 func bitsFromFloat64(x float64) uint64 { return math.Float64bits(x) }
@@ -435,17 +464,44 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 	defer st.mu.Unlock()
 
 	if st.inPos {
+		if h.live && st.closing {
+			return
+		}
 		if h.maxHold > 0 && now.Sub(st.openedAt) >= h.maxHold {
+			if h.live {
+				if st.closing {
+					return
+				}
+				st.closing = true
+				go h.doCloseAsync(sym, st, "TIME", price, now)
+				return
+			}
 			pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
 			h.closeTrade(st, sym, "TIME", price, pnl, now)
 			return
 		}
 		if price >= st.entry*h.tpPriceFrac {
+			if h.live {
+				if st.closing {
+					return
+				}
+				st.closing = true
+				go h.doCloseAsync(sym, st, "TP", price, now)
+				return
+			}
 			pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
 			h.closeTrade(st, sym, "TP", price, pnl, now)
 			return
 		}
 		if price <= st.entry*(1-h.slPriceFrac) {
+			if h.live {
+				if st.closing {
+					return
+				}
+				st.closing = true
+				go h.doCloseAsync(sym, st, "SL", price, now)
+				return
+			}
 			pnl := st.qty*(price-st.entry) - h.feeRT*st.notional
 			h.closeTrade(st, sym, "SL", price, pnl, now)
 			return
@@ -559,6 +615,14 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 	if st.pumpArmCnt >= h.pumpTicks {
 		st.pumpArmCnt = 0
 		st.lastSignalAt = now
+		if h.live {
+			if st.opening || st.inPos {
+				return
+			}
+			st.opening = true
+			go h.doOpenAsync(sym, st, price, now)
+			return
+		}
 		st.openSim(price, now)
 	}
 }
@@ -574,6 +638,9 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 	defer st.mu.Unlock()
 
 	if st.inPos {
+		return
+	}
+	if h.live && (st.opening || st.closing) {
 		return
 	}
 	if h.cooldown > 0 && !st.lastSignalAt.IsZero() && now.Sub(st.lastSignalAt) < h.cooldown {
@@ -617,6 +684,14 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		return
 	}
 	st.lastSignalAt = now
+	if h.live {
+		if st.opening || st.inPos {
+			return
+		}
+		st.opening = true
+		go h.doOpenAsync(sym, st, lastQual, now)
+		return
+	}
 	st.openSim(lastQual, now)
 }
 
@@ -641,12 +716,101 @@ func (h *hub) closeTrade(st *symState, sym, reason string, exitPrice float64, pn
 	roi := pnl / h.marginUSDT * 100
 	h.addPnL(pnl)
 	h.closedTrades.Add(1)
-	log.Printf("[%s] %s entry=%.8f exit=%.8f pnl=%.6f USDT (%.2f%% на $1) hold=%s",
-		sym, reason, st.entry, exitPrice, pnl, roi, hold.Truncate(time.Second))
+	mode := "симуляция"
+	if h.live {
+		mode = "лайв"
+	}
+	log.Printf("[%s] %s entry=%.8f exit=%.8f pnl=%.6f USDT (%.2f%% на $1) hold=%s [%s]",
+		sym, reason, st.entry, exitPrice, pnl, roi, hold.Truncate(time.Second), mode)
 	st.inPos = false
 	st.entry = 0
 	st.qty = 0
 	st.pumpArmCnt = 0
+}
+
+func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	h.restMu.Lock()
+	if int(h.openCnt.Load()) >= h.liveMaxPos {
+		h.restMu.Unlock()
+		st.mu.Lock()
+		st.opening = false
+		st.mu.Unlock()
+		return
+	}
+	if err := h.fapi.ensureLeverage(ctx, sym, h.levInt); err != nil {
+		h.restMu.Unlock()
+		st.mu.Lock()
+		st.opening = false
+		st.mu.Unlock()
+		log.Printf("[%s] leverage: %v", sym, err)
+		return
+	}
+	qtyStr, _, err := h.fapi.PrepareQtyBuy(sym, h.notionalUSDT, refPrice)
+	if err != nil {
+		h.restMu.Unlock()
+		st.mu.Lock()
+		st.opening = false
+		st.mu.Unlock()
+		log.Printf("[%s] подготовка qty: %v", sym, err)
+		return
+	}
+	avg, q, err := h.fapi.MarketBuyLong(ctx, sym, qtyStr, h.liveHedge)
+	h.restMu.Unlock()
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.opening = false
+	if err != nil {
+		log.Printf("[%s] market BUY: %v", sym, err)
+		return
+	}
+	st.inPos = true
+	if avg > 0 {
+		st.entry = avg
+	} else {
+		st.entry = refPrice
+	}
+	st.qty = q
+	st.openedAt = now
+	h.openCnt.Add(1)
+	log.Printf("[%s] открыт лонг qty=%.8f avg=%.8f", sym, q, st.entry)
+}
+
+func (h *hub) doCloseAsync(sym string, st *symState, reason string, markPrice float64, now time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	st.mu.Lock()
+	entry := st.entry
+	openQty := st.qty
+	st.mu.Unlock()
+
+	h.restMu.Lock()
+	qtyStr, _, err := h.fapi.PrepareQtyClose(sym, openQty)
+	if err != nil {
+		h.restMu.Unlock()
+		st.mu.Lock()
+		st.closing = false
+		st.mu.Unlock()
+		log.Printf("[%s] закрытие qty: %v", sym, err)
+		return
+	}
+	avg, qdone, err := h.fapi.MarketSellClose(ctx, sym, qtyStr, h.liveHedge)
+	h.restMu.Unlock()
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.closing = false
+	if err != nil {
+		log.Printf("[%s] market SELL reduceOnly: %v", sym, err)
+		return
+	}
+	pnl := qdone*(avg-entry) - h.feeRT*st.notional
+	h.closeTrade(st, sym, reason, avg, pnl, now)
+	h.openCnt.Add(-1)
 }
 
 func chunkStrings(in []string, n int) [][]string {
@@ -873,6 +1037,10 @@ func main() {
 	if symsMin < 1 {
 		symsMin = minSymbols
 	}
+	minLastPx := envGetFloat(em, "MIN_LAST_PRICE_USDT", 0)
+	if minLastPx < 0 {
+		minLastPx = 0
+	}
 	streamsConn := envGetInt(em, "STREAMS_PER_CONN", defaultStreamsConn)
 	if streamsConn < 30 {
 		streamsConn = 30
@@ -894,11 +1062,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	symbols, err := fetchUniverse(ctx, baseREST, symsMin)
+	symbols, err := fetchUniverse(ctx, baseREST, symsMin, minLastPx)
 	if err != nil {
 		log.Fatalf("universe: %v", err)
 	}
-	log.Printf("REST: %s — символов USDT PERPETUAL (топ по объёму, до %d): %d", baseREST, symsMin, len(symbols))
+	if minLastPx > 0 {
+		log.Printf("REST: %s — символов USDT PERPETUAL (топ по объёму, last≥%.6f, до %d): %d",
+			baseREST, minLastPx, symsMin, len(symbols))
+	} else {
+		log.Printf("REST: %s — символов USDT PERPETUAL (топ по объёму, до %d): %d", baseREST, symsMin, len(symbols))
+	}
 
 	pticks := envGetInt(em, "PUMP_CONFIRM_TICKS", 2)
 	if pticks < 1 {
@@ -944,6 +1117,21 @@ func main() {
 		maxHold = time.Duration(maxHoldSec) * time.Second
 	}
 
+	liveTrading := strings.TrimSpace(envGet(em, "LIVE_TRADING", "")) == "1"
+	liveMaxPos := envGetInt(em, "LIVE_MAX_POSITIONS", 1)
+	if liveMaxPos < 1 {
+		liveMaxPos = 1
+	}
+	liveHedge := strings.TrimSpace(envGet(em, "LIVE_HEDGE_MODE", "")) == "1"
+
+	levInt := int(lev + 0.5)
+	if levInt < 1 {
+		levInt = 1
+	}
+	if levInt > 125 {
+		levInt = 125
+	}
+
 	h := &hub{
 		pumpPct:       pumpPct,
 		pumpFloorPct:  pumpFloor,
@@ -968,7 +1156,28 @@ func main() {
 		aggMinMovePct: aggMinMv,
 		aggTakerBuy:   aggTaker,
 		maxHold:       maxHold,
+		live:          false,
+		liveHedge:     liveHedge,
+		liveMaxPos:    liveMaxPos,
+		levInt:        levInt,
 	}
+
+	if liveTrading {
+		key := strings.TrimSpace(envGet(em, "BINANCE_API_KEY", ""))
+		sec := strings.TrimSpace(envGet(em, "BINANCE_API_SECRET", ""))
+		if key == "" || sec == "" {
+			log.Fatal("LIVE_TRADING=1: задайте BINANCE_API_KEY и BINANCE_API_SECRET (тот же тип счёта, что и BINANCE_FAPI_URL)")
+		}
+		fc := newFAPIClient(baseREST, key, sec)
+		if err := fc.loadLotSpecs(ctx); err != nil {
+			log.Fatalf("exchangeInfo (лайв): %v", err)
+		}
+		h.fapi = fc
+		h.live = true
+		log.Printf("РЕЖИМ ЛАЙВ: реальные MARKET-ордера на %s | max одновременных позиций=%d | hedge=%v | плечо=%d×",
+			baseREST, liveMaxPos, liveHedge, levInt)
+	}
+
 	for _, s := range symbols {
 		h.states.Store(s, &symState{notional: m * lev})
 	}
@@ -1017,8 +1226,12 @@ func main() {
 	if maxHold > 0 {
 		maxHoldStr = maxHold.String()
 	}
-	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | симуляция $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
-		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, m, lev, tpm, slm, tpMove*100, slMove*100)
+	modeStr := "симуляция"
+	if h.live {
+		modeStr = fmt.Sprintf("ЛАЙВ (max поз=%d)", liveMaxPos)
+	}
+	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%)",
+		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
