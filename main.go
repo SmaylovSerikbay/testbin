@@ -535,6 +535,11 @@ func streamsKindURL(baseWS string, syms []string, kind string) string {
 	return b.String()
 }
 
+type markExitSnap struct {
+	px float64
+	at time.Time
+}
+
 type hub struct {
 	states       sync.Map // symbol -> *symState
 	pumpPct      float64  // минимальный % движения (планка с env)
@@ -613,6 +618,9 @@ type hub struct {
 
 	// лайв: доля доступного баланса под новую позицию (0.88 = оставить запас под IM/комиссии)
 	liveMarginFrac float64
+	// В лайве: TP/SL/CAP/CUT считать по mark (как в приложении Binance), а не по last из miniTicker — иначе «−11%» по марже при «тихом» last.
+	exitUseMark    bool
+	markExitCache  sync.Map // string -> markExitSnap
 
 	// выход «под памп»: быстрый scratch, трейлинг от пика, комиссия в пороге трейла
 	scratchDur       time.Duration // 0 = выкл
@@ -734,6 +742,29 @@ func (h *hub) logHTFReject(sym, why string, sim bool) {
 	}
 }
 
+// markPriceForExit — mark для расчёта выходов в лайве (кэш ~400ms, иначе REST на каждый тик).
+func (h *hub) markPriceForExit(sym string, last float64) float64 {
+	if h.fapi == nil || !h.exitUseMark {
+		return last
+	}
+	const ttl = 400 * time.Millisecond
+	now := time.Now()
+	if v, ok := h.markExitCache.Load(sym); ok {
+		s := v.(markExitSnap)
+		if now.Sub(s.at) < ttl && s.px > 0 {
+			return s.px
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	m, err := h.fapi.MarkPrice(ctx, sym)
+	cancel()
+	if err != nil || m <= 0 {
+		return last
+	}
+	h.markExitCache.Store(sym, markExitSnap{px: m, at: now})
+	return m
+}
+
 func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now time.Time) {
 	sym = normalizeFuturesSym(sym)
 	v, _ := h.states.LoadOrStore(sym, newSymState(h.notionalUSDT, h.histLen))
@@ -746,6 +777,18 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 		if h.live && st.closing {
 			return
 		}
+		pxEval := price
+		if h.live && h.exitUseMark {
+			st.mu.Unlock()
+			pxEval = h.markPriceForExit(sym, price)
+			st.mu.Lock()
+			if !st.inPos {
+				return
+			}
+			if h.live && st.closing {
+				return
+			}
+		}
 		levM := float64(h.levInt)
 		if st.posLev > 0 {
 			levM = float64(st.posLev)
@@ -754,8 +797,8 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 		slMove := priceMoveForMarginPct(h.slMarginPct, levM)
 		tpFrac := 1 + tpMove
 
-		if price > st.peakPx {
-			st.peakPx = price
+		if pxEval > st.peakPx {
+			st.peakPx = pxEval
 		}
 		var feeFrac float64
 		if st.qty > 0 && st.entry > 0 {
@@ -768,30 +811,30 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 
 		var netEst float64
 		if st.qty > 0 && st.entry > 0 {
-			netEst = st.qty*(price-st.entry) - h.feeRT*st.notional
+			netEst = st.qty*(pxEval-st.entry) - h.feeRT*st.notional
 		}
 
-		h.pushFlashSample(st, now, price)
-		if h.checkFlashDump(st, price, now) {
-			h.triggerClose(st, sym, "FLASH", price, now)
+		h.pushFlashSample(st, now, pxEval)
+		if h.checkFlashDump(st, pxEval, now) {
+			h.triggerClose(st, sym, "FLASH", pxEval, now)
 			return
 		}
 		if h.maxLossUSDT > 0 && netEst <= -h.maxLossUSDT &&
 			(h.capMinHold <= 0 || now.Sub(st.openedAt) >= h.capMinHold) {
 			st.slBelowCnt = 0
-			h.triggerClose(st, sym, "CAP", price, now)
+			h.triggerClose(st, sym, "CAP", pxEval, now)
 			return
 		}
 
 		// TP/SL до TIME: таймер не должен «перебивать» жёсткий стоп; убыток в % на маржу = движение цены × плечо.
-		if price >= st.entry*tpFrac {
+		if pxEval >= st.entry*tpFrac {
 			st.slBelowCnt = 0
-			h.triggerClose(st, sym, "TP", price, now)
+			h.triggerClose(st, sym, "TP", pxEval, now)
 			return
 		}
 		slLine := st.entry * (1 - slMove)
 		if h.slMarginPct > 0 && st.entry > 0 {
-			if price <= slLine {
+			if pxEval <= slLine {
 				st.slBelowCnt++
 				need := h.slConfirmTicks
 				if need < 1 {
@@ -799,7 +842,7 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 				}
 				if st.slBelowCnt >= need {
 					st.slBelowCnt = 0
-					h.triggerClose(st, sym, "SL", price, now)
+					h.triggerClose(st, sym, "SL", pxEval, now)
 					return
 				}
 			} else {
@@ -812,14 +855,14 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			bankHit := (h.bankNetUSDT > 0 && netEst >= h.bankNetUSDT) ||
 				(h.bankMarginPct > 0 && h.marginUSDT > 1e-12 && netEst/h.marginUSDT*100 >= h.bankMarginPct)
 			if bankHit {
-				h.triggerClose(st, sym, "BANK", price, now)
+				h.triggerClose(st, sym, "BANK", pxEval, now)
 				return
 			}
 		}
 		if h.scratchDur > 0 && now.Sub(st.openedAt) < h.scratchDur &&
 			(h.scratchMinDur <= 0 || now.Sub(st.openedAt) >= h.scratchMinDur) &&
-			!st.trailArmed && st.peakPx < st.entry*(1+trailOnFrac) && price <= st.entry*(1-h.scratchPull) {
-			h.triggerClose(st, sym, "SCRATCH", price, now)
+			!st.trailArmed && st.peakPx < st.entry*(1+trailOnFrac) && pxEval <= st.entry*(1-h.scratchPull) {
+			h.triggerClose(st, sym, "SCRATCH", pxEval, now)
 			return
 		}
 		trailEff := h.trailBack
@@ -832,30 +875,30 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 				trailEff = h.trailBackTight
 			}
 		}
-		if st.trailArmed && st.peakPx > 0 && price <= st.peakPx*(1-trailEff) {
+		if st.trailArmed && st.peakPx > 0 && pxEval <= st.peakPx*(1-trailEff) {
 			if netEst >= h.trailMinNetUSDT {
-				h.triggerClose(st, sym, "TRAIL", price, now)
+				h.triggerClose(st, sym, "TRAIL", pxEval, now)
 				return
 			}
 		}
 		// Медленный слив: SL ждёт N тиков подряд; CUT — только реальное проседание цены (не один шум + комиссия).
 		cutHoldOK := h.cutMinHold <= 0 || now.Sub(st.openedAt) >= h.cutMinHold
-		cutDirOK := !h.cutNeedBelow || price < st.entry
+		cutDirOK := !h.cutNeedBelow || pxEval < st.entry
 		if h.cutMarginPct > 0 && h.marginUSDT > 1e-12 && netEst < 0 && cutHoldOK && cutDirOK {
 			if netEst/h.marginUSDT*100 <= -h.cutMarginPct {
 				st.slBelowCnt = 0
-				h.triggerClose(st, sym, "CUT", price, now)
+				h.triggerClose(st, sym, "CUT", pxEval, now)
 				return
 			}
 		}
 		if h.maxHold > 0 && now.Sub(st.openedAt) >= h.maxHold {
 			// Уже за линией SL, но не хватило второго тика — не метить TIME (хуже смысл и тот же MARKET).
-			if h.slMarginPct > 0 && st.entry > 0 && price <= slLine {
+			if h.slMarginPct > 0 && st.entry > 0 && pxEval <= slLine {
 				st.slBelowCnt = 0
-				h.triggerClose(st, sym, "SL", price, now)
+				h.triggerClose(st, sym, "SL", pxEval, now)
 				return
 			}
-			h.triggerClose(st, sym, "TIME", price, now)
+			h.triggerClose(st, sym, "TIME", pxEval, now)
 			return
 		}
 		st.lastPrice, st.haveLast = price, true
@@ -1945,6 +1988,11 @@ func main() {
 		levInt = 125
 	}
 
+	exitUseMark := false
+	if liveTrading {
+		exitUseMark = strings.TrimSpace(envGet(em, "LIVE_EXIT_USE_MARK", "1")) != "0"
+	}
+
 	h := &hub{
 		restBase:               baseREST,
 		htfFilter:              htfF,
@@ -1984,6 +2032,7 @@ func main() {
 		liveMaxPos:             liveMaxPos,
 		levInt:                 levInt,
 		liveMarginFrac:         liveMarginFrac,
+		exitUseMark:            exitUseMark,
 		scratchDur:             scratchDur,
 		scratchMinDur:          scratchMinDur,
 		scratchPull:            scratchPull,
@@ -2204,8 +2253,12 @@ func main() {
 			capStr = fmt.Sprintf("net≤−%.4f USDT (модель)", maxLossU)
 		}
 	}
-	log.Printf("Выход по позиции: CAP=%s | CUT=%s | BANK=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%; TIME+цена≤SL→SL",
-		capStr, cutStr, bankStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100)
+	exitMarkNote := ""
+	if liveTrading && exitUseMark {
+		exitMarkNote = " | лайв: выходы по mark (как PnL в приложении; кэш ~400ms)"
+	}
+	log.Printf("Выход по позиции: CAP=%s | CUT=%s | BANK=%s | FLASH=%s | SCRATCH=%s | TRAIL: откат ≥%.2f%%%s, иначе net≥%.4f | TP +%.4f%% | SL −%.4f%%; TIME+цена≤SL→SL%s",
+		capStr, cutStr, bankStr, flashStr, scratchStr, trailBack*100, trailTightNote, trailMinNet, tpMove*100, slMove*100, exitMarkNote)
 
 	tick := time.NewTicker(statsEvery)
 	defer tick.Stop()
