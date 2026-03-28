@@ -3,6 +3,8 @@ package hft
 import (
 	"context"
 	"log"
+	"math"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,9 +100,15 @@ func ResolveWatchlist(ctx context.Context, c *futures.Client, maxN int, envWatch
 	if err != nil {
 		return nil, err
 	}
+	sortMode := strings.ToLower(strings.TrimSpace(os.Getenv("UNIVERSE_SORT")))
+	if sortMode == "" {
+		sortMode = "volume"
+	}
+
 	type row struct {
 		sym string
 		qv  float64
+		apc float64 // |% за 24ч|
 	}
 	var rows []row
 	for _, s := range stats {
@@ -114,9 +122,26 @@ func ResolveWatchlist(ctx context.Context, c *futures.Client, maxN int, envWatch
 			continue
 		}
 		qv, _ := strconv.ParseFloat(s.QuoteVolume, 64)
-		rows = append(rows, row{s.Symbol, qv})
+		pct, _ := strconv.ParseFloat(s.PriceChangePercent, 64)
+		rows = append(rows, row{s.Symbol, qv, math.Abs(pct)})
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].qv > rows[j].qv })
+	switch sortMode {
+	case "change", "pct", "mover", "movers":
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].apc != rows[j].apc {
+				return rows[i].apc > rows[j].apc
+			}
+			return rows[i].qv > rows[j].qv
+		})
+		log.Printf("UNIVERSE_SORT=change: приоритет по |%% за 24ч|, затем объём")
+	default:
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].qv != rows[j].qv {
+				return rows[i].qv > rows[j].qv
+			}
+			return rows[i].apc > rows[j].apc
+		})
+	}
 
 	var out []string
 	for i := 0; i < len(rows) && len(out) < maxN; i++ {

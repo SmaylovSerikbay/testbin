@@ -26,10 +26,16 @@ func main() {
 
 	hft.ApplyBinanceEndpoints()
 
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_RELAXED")), "1") ||
-		strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_RELAXED")), "true") {
+	envTrue := func(k string) bool {
+		v := strings.ToLower(strings.TrimSpace(os.Getenv(k)))
+		return v == "1" || v == "true" || v == "yes"
+	}
+	if envTrue("HFT_AGGRESSIVE") {
+		hft.ApplyAggressive()
+		log.Println("HFT_AGGRESSIVE: очень мягкие пороги (только демо/обучение; не ждите качества)")
+	} else if envTrue("DEMO_RELAXED") {
 		hft.ApplyDemoRelaxed()
-		log.Println("DEMO_RELAXED: пороги стратегии снижены (больше сигналов на демо)")
+		log.Println("DEMO_RELAXED: пороги стратегии снижены")
 	}
 
 	apiKey := strings.TrimSpace(os.Getenv("BINANCE_API_KEY"))
@@ -70,7 +76,7 @@ func main() {
 	if len(symbols) == 0 {
 		log.Fatal("пустой список символов")
 	}
-	log.Printf("Список наблюдения: %d символов (топ по объёму среди PERPETUAL USDT + живой bookTicker)", len(symbols))
+	log.Printf("Список наблюдения: %d символов (фильтр PERPETUAL+book; сортировка см. UNIVERSE_SORT)", len(symbols))
 
 	for _, sym := range symbols {
 		if err := hft.SetupSymbol(ctx, client, sym); err != nil {
@@ -136,8 +142,7 @@ func main() {
 		go w.Run(ctx, flag)
 	}
 
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_SMOKE_ORDER")), "1") ||
-		strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_SMOKE_ORDER")), "true") {
+	if envTrue("DEMO_SMOKE_ORDER") {
 		smokeSym := strings.ToUpper(strings.TrimSpace(os.Getenv("SMOKE_SYMBOL")))
 		if smokeSym == "" {
 			smokeSym = symbols[0]
@@ -175,6 +180,9 @@ func main() {
 			fmt.Print("\033[H\033[2J")
 			fmt.Println("══ HFT Futures Scalper (go-binance) ══", time.Now().Format("15:04:05"))
 			fmt.Printf("REST: %s  WS: %s\n", futures.BaseApiMainUrl, futures.BaseWsMainUrl)
+			if strings.Contains(futures.BaseApiMainUrl, "demo") {
+				fmt.Println("(!) Демо API — стаканы/сделки другие, чем на binance.com в браузере (там прод).")
+			}
 			fmt.Printf("Symbols: %v  Qty: %s  Cross %dx\n", symbols, qty, hft.Leverage)
 			fmt.Println("────────────────────────────────────────")
 			fmt.Printf("Session realized PnL: %.4f USDT\n", total)
@@ -207,7 +215,8 @@ func main() {
 				fmt.Printf("  %s  %s  px≈%.6f\n", s, state, px)
 			}
 			fmt.Println("────────────────────────────────────────")
-			fmt.Println("Подсказка: WATCH=BTCUSDT,ETHUSDT | DEMO_RELAXED=1 | DEMO_SMOKE_ORDER=1 — тестовый вход")
+			fmt.Println("Тест ордера: в .env DEMO_SMOKE_ORDER=1 (+ SMOKE_SYMBOL=BTCUSDT) — через 5с MARKET LONG")
+			fmt.Println("Волатильные пары: UNIVERSE_SORT=change UNIVERSE_SIZE=20 | чаще сигналы: HFT_AGGRESSIVE=1")
 			fmt.Println("Введите PANIC + Enter — закрыть всё; Ctrl+C — выход")
 		}
 	}

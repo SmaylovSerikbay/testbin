@@ -37,6 +37,21 @@ func ApplyDemoRelaxed() {
 	BuySellRatio = 2.2
 }
 
+// ApplyAggressive — максимально «шумная» стратегия для демо/теста (много ложных входов, риск лимитов).
+// Не гарантирует «20 сделок за 5 мин» — зависит от потока сделок на конкретном API (демо ≠ binance.com).
+func ApplyAggressive() {
+	MinTPS = 4
+	Move10sMin = 0.00012 // ~0.012% за 10с
+	StaleOffWatch = 90 * time.Second
+	BuySellRatio = 1.55
+	PriceUp2s = 0.00012
+	WallUSDTThresh = 2500
+	WallWindow = 400 * time.Millisecond
+	HighTPSBreakout = 5
+	EntryDebounce = 350 * time.Millisecond
+	BBInterval = 4 * time.Second
+}
+
 // SymbolWorker — один символ: aggTrade + depth20, фильтр «жара», триггеры.
 type SymbolWorker struct {
 	Symbol string
