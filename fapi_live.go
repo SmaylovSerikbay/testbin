@@ -336,6 +336,20 @@ func notionalCheckRef(mark, index float64) float64 {
 	return math.Min(mark, index)
 }
 
+// notionalBudgetRef — верхняя оценка USDT на 1 контракт для лимита нотиoнала: max(mark,index), иначе qty по index проходит min-notional, а qty×mark ломает бюджет.
+func notionalBudgetRef(mark, index float64) float64 {
+	if mark <= 0 {
+		return index
+	}
+	if index <= 0 {
+		return mark
+	}
+	if mark > index {
+		return mark
+	}
+	return index
+}
+
 const minNotionalOrderSlack = 1.022 // запас к лимиту биржи и рассинхрону mark/index между REST-вызовами
 
 // PrepareQtyBuyLive — min(ref, mark, bid) для первичного qty, затем дожим шагами пока qty×min(mark,index) ≥ MIN_NOTIONAL×slack.
@@ -374,8 +388,9 @@ func (c *fapiClient) PrepareQtyBuyLive(ctx context.Context, symbol string, notio
 			idx = mp
 		}
 		ntlRef := notionalCheckRef(mp, idx)
-		if qty*mp > notionalUSDT+1e-6 {
-			return "", 0, fmt.Errorf("min notional %.2f: при mark≈%.8f не хватает нотиoнала %.2f USDT (%s)", minN, mp, notionalUSDT, symbol)
+		budgetRef := notionalBudgetRef(mp, idx)
+		if qty*budgetRef > notionalUSDT+1e-6 {
+			return "", 0, fmt.Errorf("min notional %.2f: при max(mark,index)≈%.8f нотиoнал %.2f USDT не покрывает нужный qty (%s)", minN, budgetRef, notionalUSDT, symbol)
 		}
 		if qty*ntlRef >= minNeed-1e-10 {
 			out := formatQtyString(qty, ls.step)
@@ -435,8 +450,9 @@ func (c *fapiClient) BumpQtyAfter4164(ctx context.Context, symbol, qtyStr string
 			return "", fmt.Errorf("premiumIndex: mark≤0 (%s)", symbol)
 		}
 		ntlRef := notionalCheckRef(mp, idx)
-		if qty*mp > notionalCap+1e-5 {
-			return "", fmt.Errorf("−4164 retry: qty×mark≈%.6f > лимит нотиoнала %.2f (%s)", qty*mp, notionalCap, symbol)
+		budgetRef := notionalBudgetRef(mp, idx)
+		if qty*budgetRef > notionalCap+1e-5 {
+			return "", fmt.Errorf("−4164 retry: qty×max(mark,index)≈%.6f > лимит %.2f (%s)", qty*budgetRef, notionalCap, symbol)
 		}
 		if qty*ntlRef >= minNeed-1e-10 {
 			return formatQtyString(qty, ls.step), nil

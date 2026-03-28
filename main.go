@@ -254,24 +254,25 @@ func fetchUniverse(ctx context.Context, baseREST string, needMin int, minLastPri
 // ---- Состояние по символу ----
 
 type symState struct {
-	mu           sync.Mutex
-	lastPrice    float64
-	haveLast     bool
-	lastQuoteVol float64 // накопленный quote volume (24h) с прошлого тика
-	haveQuoteVol bool
-	inPos        bool
-	entry        float64
-	qty          float64
-	notional     float64
-	openedAt     time.Time
-	pumpArmCnt   int
-	lastSignalAt time.Time
-	opening      bool    // в процессе выставления лайв-ордера
-	closing      bool    // в процессе закрытия лайв-ордера
-	posLev       int     // фактическое плечо лайв-позиции (0 = симуляция / не задано)
-	peakPx       float64 // максимум цены в позиции (для трейлинга)
-	trailArmed   bool    // был ли откат от пика после «настоящего» движения (с учётом комиссии)
-	slBelowCnt   int     // подряд тиков с ценой ≤ линии SL (антимикрошум + меньше «ножа» на одном тике)
+	mu               sync.Mutex
+	lastPrice        float64
+	haveLast         bool
+	lastQuoteVol     float64 // накопленный quote volume (24h) с прошлого тика
+	haveQuoteVol     bool
+	inPos            bool
+	entry            float64
+	qty              float64
+	notional         float64
+	openedAt         time.Time
+	pumpArmCnt       int
+	lastSignalAt     time.Time
+	opening          bool      // в процессе выставления лайв-ордера
+	closing          bool      // в процессе закрытия лайв-ордера
+	htfCooldownUntil time.Time // после отказа HTF не дергать klines/лог до момента (антиспам agg)
+	posLev           int       // фактическое плечо лайв-позиции (0 = симуляция / не задано)
+	peakPx           float64   // максимум цены в позиции (для трейлинга)
+	trailArmed       bool      // был ли откат от пика после «настоящего» движения (с учётом комиссии)
+	slBelowCnt       int       // подряд тиков с ценой ≤ линии SL (антимикрошум + меньше «ножа» на одном тике)
 
 	retBuf   []float64 // кольцо: % изменения цены за тик (~1 с)
 	dqBuf    []float64 // кольцо: Δq USDT за тик; 0 = нет данных за эту секунду
@@ -575,9 +576,10 @@ type hub struct {
 	aggMinLastOverVwapPct float64
 
 	// Старший таймфрейм по REST klines (публично): направление последних закрытых свечей перед лонгом.
-	restBase    string
-	htfFilter   int    // 0=выкл; 1=последняя закрытая бычья (C>O); 2=close>prev close; 3=оба
-	htfInterval string // 1m, 5m, …
+	restBase        string
+	htfFilter       int           // 0=выкл; 1=последняя закрытая бычья (C>O); 2=close>prev close; 3=оба
+	htfInterval     string        // 1m, 5m, …
+	htfFailCooldown time.Duration // пауза на символ после отказа HTF (меньше REST и строк в логе)
 
 	maxHold time.Duration
 
@@ -908,6 +910,9 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			if h.entriesPaused.Load() || st.opening || st.inPos {
 				return
 			}
+			if h.htfFilter > 0 && h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+				return
+			}
 			st.opening = true
 			go h.doOpenAsync(sym, st, price, now)
 			return
@@ -916,6 +921,9 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			return
 		}
 		if h.htfFilter > 0 {
+			if h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+				return
+			}
 			st.opening = true
 			go h.doOpenSimAfterHTF(sym, st, price, now)
 			return
@@ -1030,6 +1038,9 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		if h.entriesPaused.Load() || st.opening || st.inPos {
 			return
 		}
+		if h.htfFilter > 0 && h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+			return
+		}
 		st.opening = true
 		go h.doOpenAsync(sym, st, lastQual, now)
 		return
@@ -1038,6 +1049,9 @@ func (h *hub) processAgg(sym string, price, qty float64, buyerMaker bool, tradeM
 		return
 	}
 	if h.htfFilter > 0 {
+		if h.htfFailCooldown > 0 && !now.Before(st.htfCooldownUntil) {
+			return
+		}
 		st.opening = true
 		go h.doOpenSimAfterHTF(sym, st, lastQual, now)
 		return
@@ -1138,6 +1152,9 @@ func (h *hub) doOpenSimAfterHTF(sym string, st *symState, ref float64, now time.
 	defer st.mu.Unlock()
 	st.opening = false
 	if !ok {
+		if h.htfFailCooldown > 0 {
+			st.htfCooldownUntil = time.Now().Add(h.htfFailCooldown)
+		}
 		log.Printf("[%s] симуляция: пропуск HTF: %s", sym, why)
 		return
 	}
@@ -1163,6 +1180,9 @@ func (h *hub) doOpenAsync(sym string, st *symState, refPrice float64, now time.T
 		if ok, why := h.checkHTFLong(ctx, sym); !ok {
 			st.mu.Lock()
 			st.opening = false
+			if h.htfFailCooldown > 0 {
+				st.htfCooldownUntil = time.Now().Add(h.htfFailCooldown)
+			}
 			st.mu.Unlock()
 			log.Printf("[%s] пропуск HTF: %s", sym, why)
 			return
@@ -1714,6 +1734,14 @@ func main() {
 		htfF = 0
 	}
 	htfIv := validateHTFInterval(envGet(em, "PUMP_HTF_INTERVAL", "1m"))
+	htfFailSec := envGetInt(em, "PUMP_HTF_FAIL_COOLDOWN_SEC", 12)
+	if htfFailSec < 0 {
+		htfFailSec = 0
+	}
+	var htfFailCooldown time.Duration
+	if htfFailSec > 0 {
+		htfFailCooldown = time.Duration(htfFailSec) * time.Second
+	}
 
 	miniEntS := strings.TrimSpace(envGet(em, "PUMP_MINI_ENTRY", ""))
 	var miniEntry bool
@@ -1848,6 +1876,7 @@ func main() {
 		restBase:               baseREST,
 		htfFilter:              htfF,
 		htfInterval:            htfIv,
+		htfFailCooldown:        htfFailCooldown,
 		pumpPct:                pumpPct,
 		pumpFloorPct:           pumpFloor,
 		pumpTicks:              pticks,
@@ -2039,6 +2068,9 @@ func main() {
 		htfNote = fmt.Sprintf("HTF %s: close > prev close", htfIv)
 	} else if htfF == 3 {
 		htfNote = fmt.Sprintf("HTF %s: бычья + close↑ (оба)", htfIv)
+	}
+	if htfF > 0 && htfFailCooldown > 0 {
+		htfNote += fmt.Sprintf("; пауза после отказа %v", htfFailCooldown.Truncate(time.Second))
 	}
 	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%) | SL подряд %d тик(а)",
 		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, htfNote, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100, slConfirm)
