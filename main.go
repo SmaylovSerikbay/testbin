@@ -333,6 +333,18 @@ func klineOpenClose(row []interface{}) (open, close float64, err error) {
 	return open, close, err
 }
 
+func klineHighLow(row []interface{}) (hi, lo float64, err error) {
+	if len(row) < 5 {
+		return 0, 0, fmt.Errorf("kline: короткая строка")
+	}
+	hi, err = klineParseFloat(row[2])
+	if err != nil {
+		return 0, 0, err
+	}
+	lo, err = klineParseFloat(row[3])
+	return hi, lo, err
+}
+
 func fetchFuturesKlines(ctx context.Context, baseREST, symbol, interval string, limit int) ([][]interface{}, error) {
 	base := strings.TrimSuffix(baseREST, "/")
 	u := fmt.Sprintf("%s/fapi/v1/klines?symbol=%s&interval=%s&limit=%d",
@@ -403,6 +415,20 @@ func (h *hub) checkHTFLong(ctx context.Context, sym string) (ok bool, reason str
 		}
 	default:
 		return true, ""
+	}
+	// Не путать с «пампом» на графике: без мин. размаха проходят почти плоские бычьи минутки (close>prev).
+	if h.htfMinRangePct > 0 {
+		hi, lo, err := klineHighLow(rows[n-2])
+		if err != nil {
+			return false, err.Error()
+		}
+		if lo <= 0 {
+			return false, fmt.Sprintf("%s: low≤0", h.htfInterval)
+		}
+		rngPct := (hi - lo) / lo * 100
+		if rngPct < h.htfMinRangePct {
+			return false, fmt.Sprintf("%s: узкая свеча (H−L)/L=%.3f%% < %.3f%%", h.htfInterval, rngPct, h.htfMinRangePct)
+		}
 	}
 	return true, ""
 }
@@ -600,6 +626,7 @@ type hub struct {
 	htfFilter       int           // 0=выкл; 1=последняя закрытая бычья (C>O); 2=close>prev close; 3=оба
 	htfInterval     string        // 1m, 5m, …
 	htfFailCooldown time.Duration // пауза на символ после отказа HTF (меньше REST и строк в логе)
+	htfMinRangePct  float64       // 0=выкл; последняя закрытая свеча HTF: (H−L)/L×100 ≥ порога (отсев «стоячих» монет)
 
 	// «пропуск HTF» не чаще одного раза за интервал (на символ), даже если кулдаун на symState сбился.
 	htfSkipLogMu sync.Mutex
@@ -904,10 +931,17 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			}
 		}
 		// Медленный слив: SL ждёт N тиков подряд; CUT — только реальное проседание цены (не один шум + комиссия).
+		// ROI как на бирже: от фактической маржи позиции, не от MARGIN_USDT из .env.
 		cutHoldOK := h.cutMinHold <= 0 || now.Sub(st.openedAt) >= h.cutMinHold
 		cutDirOK := !h.cutNeedBelow || pxEval < st.entry
-		if h.cutMarginPct > 0 && h.marginUSDT > 1e-12 && netEst < 0 && cutHoldOK && cutDirOK {
-			if netEst/h.marginUSDT*100 <= -h.cutMarginPct {
+		effMarCut := h.marginUSDT
+		if st.posLev > 0 && st.notional > 0 {
+			if em := st.notional / float64(st.posLev); em > 1e-9 {
+				effMarCut = em
+			}
+		}
+		if h.cutMarginPct > 0 && effMarCut > 1e-12 && netEst < 0 && cutHoldOK && cutDirOK {
+			if netEst/effMarCut*100 <= -h.cutMarginPct {
 				st.slBelowCnt = 0
 				h.triggerClose(st, sym, "CUT", pxEval, now)
 				return
@@ -1972,6 +2006,10 @@ func main() {
 	if htfFailSec > 0 {
 		htfFailCooldown = time.Duration(htfFailSec) * time.Second
 	}
+	htfMinRange := envGetFloat(em, "PUMP_HTF_MIN_RANGE_PCT", 0)
+	if htfMinRange < 0 {
+		htfMinRange = 0
+	}
 
 	miniEntS := strings.TrimSpace(envGet(em, "PUMP_MINI_ENTRY", ""))
 	var miniEntry bool
@@ -2126,6 +2164,7 @@ func main() {
 		htfFilter:              htfF,
 		htfInterval:            htfIv,
 		htfFailCooldown:        htfFailCooldown,
+		htfMinRangePct:         htfMinRange,
 		pumpPct:                pumpPct,
 		pumpFloorPct:           pumpFloor,
 		pumpTicks:              pticks,
@@ -2334,6 +2373,9 @@ func main() {
 			effCD = 2 * time.Second
 		}
 		htfNote += fmt.Sprintf("; пауза символа после отказа %v", effCD.Truncate(time.Second))
+		if htfMinRange > 0 {
+			htfNote += fmt.Sprintf("; свеча ≥%.3f%% по (H−L)/L", htfMinRange)
+		}
 	}
 	log.Printf("WS: %s — mini conn=%d agg conn=%d | вход agg: %s | вход mini: %s | мини памп: цена ≥ %s; Δq %s; окно=%d разгон=%d max=%.1f%% подряд=%d cd=%s | max_hold=%s | %s | %s $%.2f ×%.0f TP=%.0f%% SL=%.0f%% (цена +%.4f%% / −%.4f%%) | SL подряд %d тик(а)",
 		baseWS, len(batches), aggConnN, aggRule, miniRule, priceRule, volRule, histLen, warmup, maxPump, pticks, cd, maxHoldStr, htfNote, modeStr, m, lev, tpm, slm, tpMove*100, slMove*100, slConfirm)
