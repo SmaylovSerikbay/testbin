@@ -679,8 +679,9 @@ type hub struct {
 	consecLoss         atomic.Int32
 
 	slConfirmTicks int           // SL только после N подряд тиков ≤ линии стопа (1 = как раньше)
-	cutMarginPct   float64       // 0 = выкл; выход при ROI на маржу ≤ −X% (модель), быстрее чем SL подряд N тиков
-	cutMinHold     time.Duration // не CUT на первых секундах (модель ≈ −fee при цене у входа)
+	cutMarginPct     float64       // 0 = выкл; выход при ROI на маржу ≤ −X% (модель), быстрее чем SL подряд N тиков
+	cutMarginExtraPct float64      // добавка к порогу: режем при ROI ≤ −(CUT+EXTRA) — меньше преждевременных MARKET на тонких парах
+	cutMinHold       time.Duration // не CUT на первых секундах (модель ≈ −fee при цене у входа)
 	cutNeedBelow   bool          // true: CUT только если цена < входа (не резать «зелёный» тик из‑за комиссии)
 	maxLossUSDT    float64       // 0 = выкл; net в модели ≤ −X USDT — CAP (раньше глубокого SL/fill на альтах)
 	capMinHold     time.Duration // не CAP на первых тиках (модель сразу минус на комиссии round-trip)
@@ -941,7 +942,8 @@ func (h *hub) processTick(sym string, price, quoteVol float64, haveQ bool, now t
 			}
 		}
 		if h.cutMarginPct > 0 && effMarCut > 1e-12 && netEst < 0 && cutHoldOK && cutDirOK {
-			if netEst/effMarCut*100 <= -h.cutMarginPct {
+			cutThresh := h.cutMarginPct + h.cutMarginExtraPct
+			if netEst/effMarCut*100 <= -cutThresh {
 				st.slBelowCnt = 0
 				h.triggerClose(st, sym, "CUT", pxEval, now)
 				return
@@ -1841,6 +1843,10 @@ func main() {
 	if cutMg < 0 {
 		cutMg = 0
 	}
+	cutExtra := envGetFloat(em, "PUMP_CUT_MARGIN_EXTRA_PCT", 0)
+	if cutExtra < 0 {
+		cutExtra = 0
+	}
 	cutMinSec := 0
 	if strings.TrimSpace(envGet(em, "PUMP_CUT_MIN_SEC", "")) != "" {
 		cutMinSec = envGetInt(em, "PUMP_CUT_MIN_SEC", 0)
@@ -2233,9 +2239,10 @@ func main() {
 		minAvailToTrade:        minAvailTrade,
 		maxConsecLosses:        maxConsecLoss,
 		slConfirmTicks:         slConfirm,
-		cutMarginPct:           cutMg,
-		cutMinHold:             cutMinHold,
-		cutNeedBelow:           cutNeedBelow,
+		cutMarginPct:      cutMg,
+		cutMarginExtraPct: cutExtra,
+		cutMinHold:        cutMinHold,
+		cutNeedBelow:      cutNeedBelow,
 		maxLossUSDT:            maxLossU,
 		capMinHold:             capMinHold,
 	}
@@ -2432,7 +2439,11 @@ func main() {
 	}
 	cutStr := "выкл"
 	if cutMg > 0 {
-		cutStr = fmt.Sprintf("ROI≤−%.1f%% на маржу (модель)", cutMg)
+		th := cutMg + cutExtra
+		cutStr = fmt.Sprintf("ROI≤−%.2f%% на маржу (модель)", th)
+		if cutExtra > 0 {
+			cutStr += fmt.Sprintf(" [CUT %.1f%% + EXTRA %.1f%%]", cutMg, cutExtra)
+		}
 		if cutNeedBelow {
 			cutStr += ", цена<вход"
 		}
