@@ -1256,7 +1256,19 @@ func (st *symState) openSim(price float64, now time.Time) {
 
 func (h *hub) closeTrade(st *symState, sym, reason string, exitPrice float64, pnl float64, now time.Time) {
 	hold := now.Sub(st.openedAt)
-	roi := pnl / h.marginUSDT * 100
+	// ROI от фактической маржи (notional/плечо), а не от MARGIN_USDT из .env — иначе при ~0.52 USDT маржи
+	// убыток −0.178 показывался как «−17% на $1», хотя к задействованной марже это ~−34% (как в приложении).
+	effMar := h.marginUSDT
+	levROI := st.posLev
+	if levROI <= 0 {
+		levROI = h.levInt
+	}
+	if levROI > 0 && st.notional > 0 {
+		if em := st.notional / float64(levROI); em > 1e-9 {
+			effMar = em
+		}
+	}
+	roi := pnl / effMar * 100
 	h.addPnL(pnl)
 	h.closedTrades.Add(1)
 	mode := "симуляция"
@@ -1268,8 +1280,8 @@ func (h *hub) closeTrade(st *symState, sym, reason string, exitPrice float64, pn
 	if reason == "SL" && pnl > 1e-8 && st.entry > 0 && exitPrice > st.entry {
 		displayReason = "SL (тик≤стоп, fill выше входа)"
 	}
-	log.Printf("[%s] %s entry=%.8f exit=%.8f pnl=%.6f USDT (%.2f%% на $1) hold=%s [%s]",
-		sym, displayReason, st.entry, exitPrice, pnl, roi, hold.Truncate(time.Second), mode)
+	log.Printf("[%s] %s entry=%.8f exit=%.8f pnl=%.6f USDT (%.2f%% от маржи ~%.4f USDT) hold=%s [%s]",
+		sym, displayReason, st.entry, exitPrice, pnl, roi, effMar, hold.Truncate(time.Second), mode)
 	st.inPos = false
 	st.entry = 0
 	st.qty = 0
